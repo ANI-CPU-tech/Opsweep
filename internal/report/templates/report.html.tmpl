@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpsSweep Report</title>
+  <style>
+    /* TODO: add inline styles — no external CDN dependencies */
+    body { font-family: sans-serif; max-width: 960px; margin: 2rem auto; }
+    h1 { font-size: 1.8rem; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 0.5rem 0.75rem; border: 1px solid #ddd; text-align: left; }
+    th { background: #f5f5f5; }
+  </style>
+</head>
+<body>
+  <h1>OpsSweep — Cloud Cost Report</h1>
+  <p>Account: {{.AccountID}} &nbsp;|&nbsp; Estimated waste: <strong>${{printf "%.2f" .TotalMonthly}}/mo</strong></p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Resource ID</th>
+        <th>Type</th>
+        <th>Region</th>
+        <th>Idle Score</th>
+        <th>Est. $/mo</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Scores}}
+      <tr>
+        <td>{{.Resource.ID}}</td>
+        <td>{{.Resource.Type}}</td>
+        <td>{{.Resource.Region}}</td>
+        <td>{{printf "%.0f%%" (mul .IdleConfidence 100)}}</td>
+        <td><!-- TODO: wire cost estimate --></td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+</body>
+</html>

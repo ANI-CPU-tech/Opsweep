@@ -1,0 +1,61 @@
+# ─── Compiled binaries ────────────────────────────────────────────────────────
+/bin/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+opssweep
+cloud-graveyard
+
+# ─── Go toolchain ──────────────────────────────────────────────────────────────
+# Test binary and coverage artefacts
+*.test
+*.out
+coverage.html
+coverage.txt
+
+# Go workspace file (opt-in; not committed by default)
+go.work
+go.work.sum
+
+# ─── Environment & secrets ─────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials
+
+# ─── Local state / audit journal ──────────────────────────────────────────────
+# SQLite databases and journals created by opssweep
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+
+# Default opssweep state directory (can live anywhere the user configures)
+.opssweep/
+~/.opssweep/
+
+# ─── OS & editor artefacts ────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ─── goreleaser ────────────────────────────────────────────────────────────────
+.goreleaser-dist/
+
+# ─── LocalStack / Docker ──────────────────────────────────────────────────────
+.localstack/
+docker-compose.override.yml
+
+# ─── Misc ─────────────────────────────────────────────────────────────────────
+tmp/
+*.log
