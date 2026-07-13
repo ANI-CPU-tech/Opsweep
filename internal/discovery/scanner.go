@@ -268,11 +268,38 @@ func (s *AWSScanner) GetNATGateways(ctx context.Context, region string) ([]Resou
 	return nil, nil
 }
 
-// ListEnabledRegions returns all AWS regions that are enabled for the calling
-// account, used to drive the concurrent multi-region scan loop.
-// TODO: implement using ec2.DescribeRegions.
+// ─── Region enumeration ───────────────────────────────────────────────────────
+
+// ListEnabledRegions returns the names of every AWS region that is enabled for
+// the calling account.
+//
+// "Enabled" means opt-in-not-required (always-on commercial regions like
+// us-east-1) or opted-in (manually enabled regions like ap-southeast-3).
+// Regions with opt-in status "not-opted-in" are excluded automatically by the
+// API when AllRegions is false (the default), so no additional filter is
+// required.
+//
+// The EC2 client is constructed without overriding the region so it uses
+// whatever region is set in the base config (typically the caller's default
+// profile region, e.g. "us-east-1"). DescribeRegions is a global-scope call —
+// the response is identical regardless of which regional endpoint is used.
 func (s *AWSScanner) ListEnabledRegions(ctx context.Context) ([]string, error) {
-	return nil, nil
+	// Use the base config as-is — no regional override needed for this call.
+	client := ec2.NewFromConfig(s.cfg)
+
+	output, err := client.DescribeRegions(ctx, &ec2.DescribeRegionsInput{
+		// AllRegions defaults to false, which excludes "not-opted-in" regions.
+		// We do not set it explicitly to keep the zero-value semantic clear.
+	})
+	if err != nil {
+		return nil, fmt.Errorf("discovery: DescribeRegions: %w", err)
+	}
+
+	regions := make([]string, 0, len(output.Regions))
+	for _, r := range output.Regions {
+		regions = append(regions, aws.ToString(r.RegionName))
+	}
+	return regions, nil
 }
 
 // ─── Tag helpers ──────────────────────────────────────────────────────────────
