@@ -1,62 +1,285 @@
 // Package heuristics implements the idle-detection engine for OpsSweep.
+//
 // Rather than a binary used/unused check, it computes a weighted confidence
-// score per resource using CloudWatch utilization metrics, structural signals,
-// resource age, tag signals, and cost magnitude.
+// score per resource using structural state signals, tag signals, and resource
+// age. CloudWatch utilization metrics will be layered on top in a future
+// iteration.
+//
+// The central function is [Evaluate], which takes a single [discovery.Resource]
+// and returns a [Score]. The [Engine] type wraps Evaluate with batch processing
+// and a configurable idle threshold.
 package heuristics
 
 import (
-	"context"
+	"fmt"
+	"strings"
+	"time"
 
 	"github.com/anirudh/opssweep/internal/discovery"
 )
 
-// Score represents the idle-confidence result for a single resource.
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const (
+	// maxConfidence is the hard ceiling on the confidence score.
+	// Clamping to this value in clamp() prevents floating-point drift above 1.0.
+	maxConfidence = 1.0
+
+	// ageThresholdDays is the minimum resource age (in days) that triggers
+	// the age-signal confidence bump.
+	ageThresholdDays = 30
+
+	// ageBump is the confidence increase applied when a resource has existed
+	// for longer than ageThresholdDays.
+	ageBump = 0.1
+
+	// tempTagBump is the confidence increase applied when a resource carries
+	// a tag that marks it as temporary or experimental (e.g. temp=true).
+	tempTagBump = 0.2
+)
+
+// ─── Score ────────────────────────────────────────────────────────────────────
+
+// Score is the result of evaluating a single resource through the heuristics
+// engine. All fields are populated by [Evaluate]; callers should treat Score
+// values as read-only.
 type Score struct {
-	Resource          discovery.Resource
-	IdleConfidence    float64 // 0.0 (definitely active) → 1.0 (definitely idle)
-	Signals           []Signal
-	ForcedKeep        bool    // true when a keep=true or env=prod tag is present
+	// Resource is the discovery record that was evaluated.
+	Resource discovery.Resource
+
+	// IsIdle is true when the resource is considered idle — i.e. Confidence
+	// meets or exceeds the caller's threshold and ShouldSkip is false.
+	// Set by [Engine.EvaluateAll] based on the configured IdleThreshold.
+	// [Evaluate] itself does not set this field; it only sets Confidence.
+	IsIdle bool
+
+	// Confidence is the probability (0.0–1.0) that the resource is idle and
+	// safe to remove. 0.0 means definitely active; 1.0 means definitively idle.
+	// The value is clamped to [0.0, 1.0] and never exceeds maxConfidence.
+	Confidence float64
+
+	// Reasons is an ordered list of human-readable explanations that describe
+	// exactly which signals contributed to the final Confidence score. Useful
+	// for the report layer and for user trust ("why is this flagged?").
+	Reasons []string
+
+	// ShouldSkip is true when the resource carries a protection tag
+	// (keep=true, env=prod, env=production). Skip resources are excluded from
+	// teardown consideration entirely — no exceptions.
+	ShouldSkip bool
 }
 
-// Signal is a single contributing factor to the idle confidence score.
-type Signal struct {
-	Name        string
-	Description string
-	Weight      float64 // contribution to the final score
-	Value       float64 // normalised 0.0–1.0 signal strength
-}
+// ─── Config ───────────────────────────────────────────────────────────────────
 
 // Config holds tunable parameters for the heuristics engine.
 type Config struct {
-	// LookbackDays is the CloudWatch metric window (default: 14).
-	LookbackDays int
-	// IdleThreshold is the minimum score to flag a resource (default: 0.6).
+	// IdleThreshold is the minimum Confidence score at which a resource is
+	// considered idle and flagged for review. Default: 0.6.
 	IdleThreshold float64
+
+	// Now is the reference time used for age calculations. Defaults to
+	// time.Now() when zero. Exposed for deterministic unit testing.
+	Now time.Time
 }
 
-// DefaultConfig returns the recommended default heuristics configuration.
+// DefaultConfig returns the recommended production configuration.
 func DefaultConfig() Config {
 	return Config{
-		LookbackDays:  14,
 		IdleThreshold: 0.6,
 	}
 }
 
-// Engine applies idle heuristics to a slice of discovered resources.
+// now returns the reference time, falling back to time.Now() when cfg.Now
+// is the zero value. This keeps production behaviour correct while allowing
+// tests to inject a fixed timestamp.
+func (c Config) now() time.Time {
+	if c.Now.IsZero() {
+		return time.Now()
+	}
+	return c.Now
+}
+
+// ─── Engine ───────────────────────────────────────────────────────────────────
+
+// Engine applies the heuristics scoring pipeline to a batch of resources.
 type Engine struct {
 	cfg Config
 }
 
-// NewEngine creates a new heuristics Engine with the given configuration.
+// NewEngine creates an Engine with the given configuration.
 func NewEngine(cfg Config) *Engine {
 	return &Engine{cfg: cfg}
 }
 
-// Score computes the idle confidence score for every resource in the list.
-// Resources tagged keep=true or env=prod are marked ForcedKeep and excluded
-// from the flagged set regardless of their utilization metrics.
-// TODO: implement CloudWatch metric fetching and weighted scoring.
-func (e *Engine) Score(ctx context.Context, resources []discovery.Resource) ([]Score, error) {
-	// TODO: implement
-	return nil, nil
+// EvaluateAll scores every resource in the slice and returns the full list of
+// Score results. Resources with ShouldSkip=true are included in the output
+// (so the report layer can show them as "protected") but have IsIdle=false.
+//
+// The method is intentionally synchronous — the caller (runner.go) already
+// parallelises across regions. There is no benefit to parallelising inside a
+// single region's small resource list.
+func (e *Engine) EvaluateAll(resources []discovery.Resource) []Score {
+	scores := make([]Score, 0, len(resources))
+	for _, res := range resources {
+		s := Evaluate(res, e.cfg)
+		// Apply the idle threshold to set the IsIdle convenience flag.
+		if !s.ShouldSkip && s.Confidence >= e.cfg.IdleThreshold {
+			s.IsIdle = true
+		}
+		scores = append(scores, s)
+	}
+	return scores
+}
+
+// ─── Evaluate ─────────────────────────────────────────────────────────────────
+
+// Evaluate computes the idle Score for a single resource by running three
+// signal evaluators in order:
+//
+//  1. [evaluateTags]      — tag-based overrides and bumps (runs first; a
+//     protection tag causes an immediate return with ShouldSkip=true)
+//  2. [evaluateStructure] — structural/state signals (EBS available, EIP
+//     unattached, EC2 stopped)
+//  3. [evaluateAge]       — age-based confidence bump
+//
+// The resulting Confidence is clamped to [0.0, 1.0] before returning.
+// IsIdle is NOT set here — that is the responsibility of [Engine.EvaluateAll],
+// which applies the configurable threshold.
+func Evaluate(res discovery.Resource, cfg Config) Score {
+	s := Score{Resource: res}
+
+	// ── 1. Tag signals ────────────────────────────────────────────────────────
+	// Tag evaluation runs first and may short-circuit the entire pipeline.
+	if done := evaluateTags(res, &s); done {
+		return s
+	}
+
+	// ── 2. Structural signals ─────────────────────────────────────────────────
+	evaluateStructure(res, &s)
+
+	// ── 3. Age signal ─────────────────────────────────────────────────────────
+	evaluateAge(res, cfg, &s)
+
+	// Clamp to [0.0, 1.0] — floating-point addition can drift above 1.0.
+	s.Confidence = clamp(s.Confidence)
+
+	return s
+}
+
+// ─── Signal evaluators ────────────────────────────────────────────────────────
+
+// evaluateTags inspects the resource's tag map for two categories:
+//
+//   - Protection tags (keep=true, env=prod, env=production): sets ShouldSkip=true
+//     and returns true to signal that evaluation should stop immediately.
+//
+//   - Temporary/experimental tags (temp=true, project=hackathon): adds a
+//     tempTagBump to Confidence and continues evaluation (returns false).
+//
+// Tag keys and values are compared case-insensitively.
+func evaluateTags(res discovery.Resource, s *Score) (skipEvaluation bool) {
+	for rawKey, rawVal := range res.Tags {
+		key := strings.ToLower(rawKey)
+		val := strings.ToLower(rawVal)
+
+		switch {
+		// ── Protection tags — hard stop, no teardown ever ────────────────────
+		case key == "keep" && val == "true":
+			s.ShouldSkip = true
+			s.Reasons = append(s.Reasons, "protected by tag keep=true")
+			return true
+
+		case key == "env" && (val == "prod" || val == "production"):
+			s.ShouldSkip = true
+			s.Reasons = append(s.Reasons, fmt.Sprintf("protected by tag env=%s", rawVal))
+			return true
+
+		// ── Temporary/hackathon tags — raise confidence ───────────────────────
+		case key == "temp" && val == "true":
+			s.Confidence += tempTagBump
+			s.Reasons = append(s.Reasons, fmt.Sprintf("tag temp=true suggests disposable resource (+%.1f)", tempTagBump))
+
+		case key == "project" && val == "hackathon":
+			s.Confidence += tempTagBump
+			s.Reasons = append(s.Reasons, fmt.Sprintf("tag project=hackathon suggests disposable resource (+%.1f)", tempTagBump))
+		}
+	}
+	return false
+}
+
+// evaluateStructure applies resource-type-specific structural signals.
+// These are the strongest non-tag signals because they reflect AWS-reported
+// state rather than inferred behaviour.
+//
+// Signals applied:
+//   - EBS volume in "available" state: confidence 0.9 (unattached, billing for nothing)
+//   - Elastic IP in "unattached" state: confidence 0.9 (no association, still billing)
+//   - EC2 instance in "stopped" state: confidence 0.5 (not running but EBS still charges)
+//
+// The structural confidence replaces (rather than adds to) any prior confidence
+// from tag bumps only when it is higher — this ensures a hackathon-tagged
+// stopped instance doesn't get double-counted downward.
+func evaluateStructure(res discovery.Resource, s *Score) {
+	switch res.Type {
+	case discovery.ResourceTypeEBSVolume:
+		if res.State == "available" {
+			applyIfHigher(s, 0.9, "EBS volume is unattached (state=available) — no instance is using it")
+		}
+
+	case discovery.ResourceTypeElasticIP:
+		if res.State == "unattached" {
+			applyIfHigher(s, 0.9, "Elastic IP is unassociated (state=unattached) — billing with no attached resource")
+		}
+
+	case discovery.ResourceTypeEC2Instance:
+		if res.State == "stopped" {
+			applyIfHigher(s, 0.5, "EC2 instance is stopped — not running but attached EBS volumes continue to accrue charges")
+		}
+	}
+}
+
+// evaluateAge adds ageBump to the confidence score when the resource's
+// CreationTime is known and is older than ageThresholdDays. Older resources
+// are more likely to be forgotten side-project leftovers.
+//
+// CreationTime zero-values (EIPs, resources where the API does not expose a
+// creation timestamp) are silently skipped — no bump, no penalty.
+func evaluateAge(res discovery.Resource, cfg Config, s *Score) {
+	if res.CreationTime.IsZero() {
+		return
+	}
+
+	age := cfg.now().Sub(res.CreationTime)
+	threshold := time.Duration(ageThresholdDays) * 24 * time.Hour
+
+	if age >= threshold {
+		s.Confidence += ageBump
+		days := int(age.Hours() / 24)
+		s.Reasons = append(s.Reasons,
+			fmt.Sprintf("resource is %d days old (older than %d-day threshold) (+%.1f)", days, ageThresholdDays, ageBump),
+		)
+	}
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+// applyIfHigher sets s.Confidence to value and appends reason only when value
+// exceeds the current Confidence. This prevents a structural signal from
+// lowering a score that was already raised by tag bumps.
+func applyIfHigher(s *Score, value float64, reason string) {
+	if value > s.Confidence {
+		s.Confidence = value
+		s.Reasons = append(s.Reasons, reason)
+	}
+}
+
+// clamp constrains v to the range [0.0, maxConfidence].
+func clamp(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > maxConfidence {
+		return maxConfidence
+	}
+	return v
 }
