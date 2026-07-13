@@ -1,59 +1,136 @@
 // Package discovery enumerates AWS resources across all enabled regions
 // using the AWS SDK v2. It covers EC2 instances, EBS volumes and snapshots,
 // Elastic IPs, load balancers (ALB/NLB/CLB), RDS instances, and NAT gateways.
-// Scanning is performed concurrently across regions using goroutines with a
-// client-side rate limiter to avoid API throttling.
+//
+// Architecture note: all AWS API calls are hidden behind the [AWSScannerAPI]
+// interface. This keeps the scanning logic fully unit-testable without real
+// credentials — pass a mock that satisfies the interface and the rest of the
+// package works identically.
 package discovery
 
 import (
 	"context"
-
-	"github.com/aws/aws-sdk-go-v2/aws"
+	"time"
 )
 
-// ResourceType enumerates the AWS resource types that OpsSweep can discover.
+// ─── Resource types ──────────────────────────────────────────────────────────
+
+// ResourceType is a typed string that identifies the kind of AWS resource.
+// Using a named type (rather than plain strings) makes switch exhaustiveness
+// checkable and prevents accidental comparisons against arbitrary strings.
 type ResourceType string
 
 const (
-	ResourceTypeEC2Instance   ResourceType = "ec2:instance"
-	ResourceTypeEBSVolume     ResourceType = "ec2:ebs-volume"
-	ResourceTypeEBSSnapshot   ResourceType = "ec2:ebs-snapshot"
-	ResourceTypeElasticIP     ResourceType = "ec2:elastic-ip"
-	ResourceTypeALB           ResourceType = "elasticloadbalancing:alb"
-	ResourceTypeNLB           ResourceType = "elasticloadbalancing:nlb"
-	ResourceTypeCLB           ResourceType = "elasticloadbalancing:clb"
-	ResourceTypeRDSInstance   ResourceType = "rds:instance"
-	ResourceTypeNATGateway    ResourceType = "ec2:nat-gateway"
+	// ResourceTypeEC2Instance represents an Amazon EC2 virtual machine instance.
+	ResourceTypeEC2Instance ResourceType = "ec2:instance"
+
+	// ResourceTypeEBSVolume represents an Amazon EBS block storage volume.
+	ResourceTypeEBSVolume ResourceType = "ec2:ebs-volume"
+
+	// ResourceTypeEBSSnapshot represents a point-in-time snapshot of an EBS volume.
+	ResourceTypeEBSSnapshot ResourceType = "ec2:ebs-snapshot"
+
+	// ResourceTypeElasticIP represents an Elastic IP address allocation.
+	ResourceTypeElasticIP ResourceType = "ec2:elastic-ip"
+
+	// ResourceTypeALB represents an Application Load Balancer.
+	ResourceTypeALB ResourceType = "elasticloadbalancing:alb"
+
+	// ResourceTypeNLB represents a Network Load Balancer.
+	ResourceTypeNLB ResourceType = "elasticloadbalancing:nlb"
+
+	// ResourceTypeCLB represents a Classic Load Balancer.
+	ResourceTypeCLB ResourceType = "elasticloadbalancing:clb"
+
+	// ResourceTypeRDSInstance represents an Amazon RDS database instance.
+	ResourceTypeRDSInstance ResourceType = "rds:instance"
+
+	// ResourceTypeNATGateway represents an Amazon VPC NAT gateway.
+	ResourceTypeNATGateway ResourceType = "ec2:nat-gateway"
 )
 
-// Resource represents a discovered AWS resource with its metadata.
+// ─── Core data structure ─────────────────────────────────────────────────────
+
+// Resource is the normalised representation of a discovered AWS resource.
+//
+// All service-specific fields are flattened into this common struct so that
+// the heuristics engine can operate on a single type regardless of which AWS
+// service the resource came from. Fields that are not applicable to a given
+// resource type are left at their zero values.
 type Resource struct {
-	ID           string
-	Type         ResourceType
-	Region       string
-	Name         string            // from the Name tag if present
-	Tags         map[string]string // all resource tags
-	CreatedAt    string            // RFC3339 timestamp
-	StateRaw     string            // raw state string from AWS (e.g. "available", "in-use")
-	RawMetadata  map[string]any    // service-specific fields for heuristic scoring
+	// ID is the primary AWS identifier for the resource (e.g. "i-0abc123def456",
+	// "vol-0abc123", "eipalloc-0abc123"). Always non-empty after discovery.
+	ID string
+
+	// Type identifies which AWS service and resource kind this record represents.
+	Type ResourceType
+
+	// Region is the AWS region where the resource lives (e.g. "us-east-1").
+	Region string
+
+	// Name is the value of the resource's "Name" tag, if present.
+	// Empty string when the tag is absent.
+	Name string
+
+	// State is the normalised lifecycle state reported by AWS
+	// (e.g. "running", "stopped", "available", "in-use").
+	State string
+
+	// Tags is the full set of key/value tags attached to the resource.
+	// A nil map means no tags were present or the resource type does not
+	// support tagging.
+	Tags map[string]string
+
+	// CreationTime is when the resource was created, as reported by AWS.
+	// The zero value indicates that the creation time was not available
+	// (some resource types omit it).
+	CreationTime time.Time
 }
 
-// Scanner discovers resources across one or more AWS regions.
-type Scanner struct {
-	cfg     aws.Config
-	regions []string
-}
+// ─── Mockable interface ───────────────────────────────────────────────────────
 
-// NewScanner creates a Scanner using the provided AWS config.
-// If regions is empty, the scanner will enumerate all enabled regions.
-func NewScanner(cfg aws.Config, regions []string) *Scanner {
-	return &Scanner{cfg: cfg, regions: regions}
-}
+// AWSScannerAPI defines every AWS API call that the discovery engine makes.
+//
+// Keeping all SDK calls behind this interface has two benefits:
+//  1. Unit tests can inject a mock (e.g. generated by mockery) without needing
+//     real AWS credentials or network access.
+//  2. The interface documents the exact API surface the package depends on,
+//     making future SDK upgrades straightforward to audit.
+//
+// Each method targets a single region. The caller is responsible for invoking
+// the method concurrently across regions and aggregating the results.
+type AWSScannerAPI interface {
+	// GetEC2Instances returns all EC2 instances in the given region.
+	// Stopped and terminated instances are included so that the heuristics
+	// engine can factor in long-stopped resources.
+	GetEC2Instances(ctx context.Context, region string) ([]Resource, error)
 
-// Scan runs resource discovery across all configured regions concurrently
-// and returns the aggregated list of discovered resources.
-// TODO: implement concurrent multi-region scanning with errgroup + rate limiter.
-func (s *Scanner) Scan(ctx context.Context) ([]Resource, error) {
-	// TODO: implement
-	return nil, nil
+	// GetEBSVolumes returns all EBS volumes in the given region.
+	// Volumes in the "available" state (unattached) are the primary signal
+	// for idle EBS resources.
+	GetEBSVolumes(ctx context.Context, region string) ([]Resource, error)
+
+	// GetEBSSnapshots returns all EBS snapshots owned by the calling account
+	// in the given region.
+	GetEBSSnapshots(ctx context.Context, region string) ([]Resource, error)
+
+	// GetElasticIPs returns all Elastic IP allocations in the given region.
+	// Unassociated EIPs incur a charge even when no instance is attached.
+	GetElasticIPs(ctx context.Context, region string) ([]Resource, error)
+
+	// GetLoadBalancers returns all ALB, NLB, and CLB load balancers in the
+	// given region. Load balancers with zero healthy targets are flagged as idle.
+	GetLoadBalancers(ctx context.Context, region string) ([]Resource, error)
+
+	// GetRDSInstances returns all RDS database instances in the given region.
+	// Instances with near-zero connection counts are candidates for teardown.
+	GetRDSInstances(ctx context.Context, region string) ([]Resource, error)
+
+	// GetNATGateways returns all NAT gateways in the given region.
+	// NAT gateways have a fixed hourly charge regardless of traffic.
+	GetNATGateways(ctx context.Context, region string) ([]Resource, error)
+
+	// ListEnabledRegions returns the list of AWS regions that are enabled for
+	// the calling account. Used to drive the concurrent multi-region scan.
+	ListEnabledRegions(ctx context.Context) ([]string, error)
 }
