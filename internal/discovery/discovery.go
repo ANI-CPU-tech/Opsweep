@@ -133,4 +133,5 @@ type AWSScannerAPI interface {
 	// ListEnabledRegions returns the list of AWS regions that are enabled for
 	// the calling account. Used to drive the concurrent multi-region scan.
 	ListEnabledRegions(ctx context.Context) ([]string, error)
+	
 }

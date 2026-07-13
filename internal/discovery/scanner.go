@@ -115,10 +115,60 @@ func mapEC2State(state *ec2types.InstanceState) string {
 // (nil, nil) — empty result, no error — which is a valid "no resources found"
 // response. Implementations will be added in subsequent commits.
 
-// GetEBSVolumes returns all EBS volumes in the given region.
-// TODO: implement using ec2.NewDescribeVolumesPaginator.
+// ─── EBS volumes ──────────────────────────────────────────────────────────────
+
+// GetEBSVolumes returns every EBS volume visible to the calling account in the
+// given region.
+//
+// Volumes in the "available" state are unattached — they have no running
+// instance to justify their cost and are the primary idle signal for EBS.
+// All states are returned so the heuristics engine has the complete picture.
+//
+// The method paginates automatically — AWS returns at most 500 volumes per
+// DescribeVolumes page.
 func (s *AWSScanner) GetEBSVolumes(ctx context.Context, region string) ([]Resource, error) {
-	return nil, nil
+	regionalCfg := s.cfg.Copy()
+	regionalCfg.Region = region
+	client := ec2.NewFromConfig(regionalCfg)
+
+	var resources []Resource
+
+	// DescribeVolumesPaginator handles the NextToken loop for us.
+	paginator := ec2.NewDescribeVolumesPaginator(client, &ec2.DescribeVolumesInput{
+		// No filters: return all volumes. Filtering by state here would hide
+		// "in-use" volumes attached to stopped instances — still worth flagging.
+	})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("discovery: DescribeVolumes in %s: %w", region, err)
+		}
+
+		for _, volume := range page.Volumes {
+			resources = append(resources, mapEBSVolume(volume, region))
+		}
+	}
+
+	return resources, nil
+}
+
+// mapEBSVolume converts an AWS SDK ec2types.Volume into our normalised
+// [Resource] struct.
+//
+// State is a value-type enum (ec2types.VolumeState) rather than a pointer, so
+// it is cast directly to string without a nil guard.
+// CreateTime is a *time.Time pointer and is safely dereferenced via aws.ToTime.
+func mapEBSVolume(v ec2types.Volume, region string) Resource {
+	return Resource{
+		ID:           aws.ToString(v.VolumeId),
+		Type:         ResourceTypeEBSVolume,
+		Region:       region,
+		Name:         extractNameTag(v.Tags),
+		State:        string(v.State),
+		Tags:         convertTags(v.Tags),
+		CreationTime: aws.ToTime(v.CreateTime),
+	}
 }
 
 // GetEBSSnapshots returns all EBS snapshots owned by the calling account in
