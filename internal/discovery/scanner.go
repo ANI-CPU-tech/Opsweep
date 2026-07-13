@@ -178,11 +178,75 @@ func (s *AWSScanner) GetEBSSnapshots(ctx context.Context, region string) ([]Reso
 	return nil, nil
 }
 
-// GetElasticIPs returns all Elastic IP allocations in the given region.
-// TODO: implement using ec2.DescribeAddresses (no pagination needed — EIPs are
-// bounded by the account quota, typically ≤5 per region by default).
+// ─── Elastic IPs ──────────────────────────────────────────────────────────────
+
+// GetElasticIPs returns every Elastic IP allocation visible to the calling
+// account in the given region.
+//
+// DescribeAddresses is not paginated — the AWS API returns all EIPs in a single
+// response. This is safe because EIP allocations are bounded by the account
+// quota (default: 5 per region, raiseable to ~300), so the response is always
+// small.
+//
+// An unassociated EIP (AssociationId == nil) accrues a small hourly charge
+// ($0.005/hr as of 2024) even when nothing is attached. The state field is set
+// to "unattached" in that case so the heuristics engine can detect it with a
+// simple string comparison rather than re-implementing the nil check.
 func (s *AWSScanner) GetElasticIPs(ctx context.Context, region string) ([]Resource, error) {
-	return nil, nil
+	regionalCfg := s.cfg.Copy()
+	regionalCfg.Region = region
+	client := ec2.NewFromConfig(regionalCfg)
+
+	output, err := client.DescribeAddresses(ctx, &ec2.DescribeAddressesInput{
+		// No filters: return all allocations so nothing is silently hidden.
+	})
+	if err != nil {
+		return nil, fmt.Errorf("discovery: DescribeAddresses in %s: %w", region, err)
+	}
+
+	resources := make([]Resource, 0, len(output.Addresses))
+	for _, addr := range output.Addresses {
+		resources = append(resources, mapElasticIP(addr, region))
+	}
+
+	return resources, nil
+}
+
+// mapElasticIP converts an AWS SDK ec2types.Address into our normalised
+// [Resource] struct.
+//
+// ID preference: AllocationId is used when present (VPC-scoped EIPs always
+// have one). For the rare EC2-Classic EIP that has no AllocationId, we fall
+// back to the PublicIp string so the resource is never anonymous.
+//
+// State: derived from AssociationId — if nil or empty the EIP is unattached
+// and billing without serving any traffic. "unattached" is the sentinel value
+// the heuristics engine checks for.
+//
+// CreationTime: the DescribeAddresses API does not expose an allocation
+// timestamp, so this field is left at its zero value (time.Time{}).
+func mapElasticIP(addr ec2types.Address, region string) Resource {
+	id := aws.ToString(addr.AllocationId)
+	if id == "" {
+		// EC2-Classic EIPs have no AllocationId; use the IP string as a
+		// stable identifier so the resource can still be tracked and deleted.
+		id = aws.ToString(addr.PublicIp)
+	}
+
+	state := "in-use"
+	if aws.ToString(addr.AssociationId) == "" {
+		state = "unattached"
+	}
+
+	return Resource{
+		ID:     id,
+		Type:   ResourceTypeElasticIP,
+		Region: region,
+		Name:   extractNameTag(addr.Tags),
+		State:  state,
+		Tags:   convertTags(addr.Tags),
+		// CreationTime intentionally omitted — not available from DescribeAddresses.
+	}
 }
 
 // GetLoadBalancers returns all ALB, NLB, and CLB load balancers in the given region.
