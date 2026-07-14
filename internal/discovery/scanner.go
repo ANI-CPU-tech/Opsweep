@@ -3,6 +3,7 @@ package discovery
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -39,12 +40,25 @@ func NewAWSScanner(cfg aws.Config) *AWSScanner {
 
 // ─── EC2 instances ────────────────────────────────────────────────────────────
 
+// cwLookbackDays is the default CloudWatch metric window used when fetching
+// CPU utilisation for running EC2 instances. 14 days is long enough to smooth
+// out weekend troughs and short-lived spikes while staying within the
+// CloudWatch standard-resolution retention window.
+const cwLookbackDays = 14
+
 // GetEC2Instances returns every EC2 instance visible to the calling account in
 // the given region, including stopped and terminated instances.
 //
-// Stopped/terminated instances are intentionally included: a long-stopped
-// instance still has an attached EBS root volume that is accruing charges, and
-// the heuristics engine needs that signal.
+// For each instance in the "running" state, the method additionally fetches the
+// average CPU utilisation over the last [cwLookbackDays] days from CloudWatch
+// and stores it in [Resource.CPUUtilizationPercent]. This powers the zombie-
+// instance detection in the heuristics engine.
+//
+// CloudWatch fetch failures are non-fatal: a warning is written to stderr and
+// the field is left nil so the rest of the scan continues unaffected.
+//
+// Stopped and terminated instances skip the CloudWatch call entirely — they
+// produce no CPU metrics, so the call would always return zero data points.
 //
 // The method paginates automatically — AWS returns at most 1,000 instances per
 // DescribeInstances page.
@@ -74,7 +88,33 @@ func (s *AWSScanner) GetEC2Instances(ctx context.Context, region string) ([]Reso
 		// so we iterate both levels.
 		for _, reservation := range page.Reservations {
 			for _, instance := range reservation.Instances {
-				resources = append(resources, mapEC2Instance(instance, region))
+				res := mapEC2Instance(instance, region)
+
+				// ── CloudWatch CPU fetch ──────────────────────────────────
+				// Only running instances produce CPUUtilization metrics.
+				// Stopped/terminated instances are skipped to avoid wasting
+				// API quota on calls that will always return empty results.
+				if res.State == "running" {
+					avg, err := FetchEC2CPUUtilization(ctx, s.cfg, res.ID, region, cwLookbackDays)
+					if err != nil {
+						// Non-fatal: log a warning and leave the field nil.
+						// Common causes: insufficient IAM permissions for
+						// cloudwatch:GetMetricStatistics, or API rate limiting.
+						// The heuristics engine handles nil gracefully by
+						// relying on structural signals alone for this instance.
+						fmt.Fprintf(os.Stderr,
+							"warning: could not fetch CPU metrics for %s in %s: %v\n",
+							res.ID, region, err,
+						)
+					} else {
+						// CloudWatch returned data (even if avg == 0.0).
+						// Store a pointer so the heuristics engine can
+						// distinguish "confirmed 0% CPU" from "no data".
+						res.CPUUtilizationPercent = aws.Float64(avg)
+					}
+				}
+
+				resources = append(resources, res)
 			}
 		}
 	}
@@ -85,6 +125,10 @@ func (s *AWSScanner) GetEC2Instances(ctx context.Context, region string) ([]Reso
 // mapEC2Instance converts an AWS SDK EC2 Instance value into our normalised
 // [Resource] struct. All SDK pointer dereferences are guarded with aws.ToString /
 // aws.ToTime so a nil field never causes a panic.
+//
+// This function is a pure data mapper — it makes no network calls. CloudWatch
+// enrichment is applied by the caller ([AWSScanner.GetEC2Instances]) after this
+// function returns, so that the mapping logic stays testable in isolation.
 func mapEC2Instance(i ec2types.Instance, region string) Resource {
 	return Resource{
 		ID:           aws.ToString(i.InstanceId),
@@ -94,6 +138,9 @@ func mapEC2Instance(i ec2types.Instance, region string) Resource {
 		State:        mapEC2State(i.State),
 		Tags:         convertTags(i.Tags),
 		CreationTime: aws.ToTime(i.LaunchTime),
+		// CPUUtilizationPercent is intentionally left nil here.
+		// It is populated by GetEC2Instances after this mapper returns,
+		// keeping this function side-effect-free and unit-testable.
 	}
 }
 
