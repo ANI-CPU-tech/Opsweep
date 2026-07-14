@@ -231,7 +231,8 @@ func evaluateTags(res discovery.Resource, s *Score) (skipEvaluation bool) {
 //
 // Signals applied:
 //   - EBS volume in "available" state:   confidence 0.9  (unattached, billing for nothing)
-//   - Elastic IP in "unattached" state:  confidence 0.9  (no association, still billing)
+//   - Elastic IP in "unattached" state:  confidence 1.0  (unambiguous waste — allocated,
+//     not associated, and billing $0.005/hr with zero utility)
 //   - EC2 instance "stopped":            confidence 0.5  (no compute charge, but attached
 //     EBS volumes continue to accrue storage charges)
 //   - EC2 instance "running", CPU < 2%:  confidence 0.85 (zombie — powered on but idle)
@@ -253,7 +254,8 @@ func evaluateStructure(res discovery.Resource, s *Score) {
 
 	case discovery.ResourceTypeElasticIP:
 		if res.State == "unattached" {
-			applyIfHigher(s, 0.9, "Elastic IP is unassociated (state=unattached) — billing with no attached resource")
+			applyIfHigher(s, 1.0,
+				"unattached Elastic IP: allocated but not associated with any instance or network interface — billing with zero utility")
 		}
 
 	case discovery.ResourceTypeEC2Instance:
