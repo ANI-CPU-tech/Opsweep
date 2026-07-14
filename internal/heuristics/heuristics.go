@@ -1,9 +1,8 @@
 // Package heuristics implements the idle-detection engine for OpsSweep.
 //
 // Rather than a binary used/unused check, it computes a weighted confidence
-// score per resource using structural state signals, tag signals, and resource
-// age. CloudWatch utilization metrics will be layered on top in a future
-// iteration.
+// score per resource using structural state signals, CloudWatch utilization
+// metrics, tag signals, and resource age.
 //
 // The central function is [Evaluate], which takes a single [discovery.Resource]
 // and returns a [Score]. The [Engine] type wraps Evaluate with batch processing
@@ -36,6 +35,25 @@ const (
 	// tempTagBump is the confidence increase applied when a resource carries
 	// a tag that marks it as temporary or experimental (e.g. temp=true).
 	tempTagBump = 0.2
+
+	// zombieCPUThresholdPercent is the maximum average CPU utilisation (%) at
+	// which a running EC2 instance is classified as a zombie — running but
+	// doing no meaningful work. 2% is deliberately conservative: real workloads
+	// (web servers, cron jobs, idle daemons) typically sit above 2–5%, while
+	// truly forgotten instances hover near 0%.
+	zombieCPUThresholdPercent = 2.0
+
+	// zombieConfidence is the idle confidence score assigned to an EC2 instance
+	// that passes the zombie CPU check. 0.85 is high but not 1.0 — we
+	// acknowledge that CPU alone is not proof of abandonment (e.g. a
+	// GPU-compute instance uses near-zero CPU by design).
+	zombieConfidence = 0.85
+
+	// activeRunningConfidence is the score forced onto a running EC2 instance
+	// whose CPU utilisation is at or above zombieCPUThresholdPercent. Setting
+	// it to 0.0 overrides any tag-based bumps that may have been applied
+	// earlier, because measured activity is stronger evidence than a tag.
+	activeRunningConfidence = 0.0
 )
 
 // ─── Score ────────────────────────────────────────────────────────────────────
@@ -212,15 +230,22 @@ func evaluateTags(res discovery.Resource, s *Score) (skipEvaluation bool) {
 // state rather than inferred behaviour.
 //
 // Signals applied:
-//   - EBS volume in "available" state: confidence 0.9 (unattached, billing for nothing)
-//   - Elastic IP in "unattached" state: confidence 0.9 (no association, still billing)
-//   - EC2 instance in "stopped" state: confidence 0.5 (not running but EBS still charges)
+//   - EBS volume in "available" state:   confidence 0.9  (unattached, billing for nothing)
+//   - Elastic IP in "unattached" state:  confidence 0.9  (no association, still billing)
+//   - EC2 instance "stopped":            confidence 0.5  (no compute charge, but attached
+//     EBS volumes continue to accrue storage charges)
+//   - EC2 instance "running", CPU < 2%:  confidence 0.85 (zombie — powered on but idle)
+//   - EC2 instance "running", CPU ≥ 2%:  confidence 0.0  (active — force-clear the score)
+//   - EC2 instance "running", no CPU data: no change     (insufficient data, stay neutral)
 //
 // The structural confidence replaces (rather than adds to) any prior confidence
-// from tag bumps only when it is higher — this ensures a hackathon-tagged
-// stopped instance doesn't get double-counted downward.
+// from tag bumps — but only when it is higher — so a hackathon-tagged stopped
+// instance isn't pushed below its tag-derived score.
+// The one exception is the "active running" case: confirmed activity hard-resets
+// the score to 0.0 because measured utilisation is stronger evidence than any tag.
 func evaluateStructure(res discovery.Resource, s *Score) {
 	switch res.Type {
+
 	case discovery.ResourceTypeEBSVolume:
 		if res.State == "available" {
 			applyIfHigher(s, 0.9, "EBS volume is unattached (state=available) — no instance is using it")
@@ -232,8 +257,68 @@ func evaluateStructure(res discovery.Resource, s *Score) {
 		}
 
 	case discovery.ResourceTypeEC2Instance:
-		if res.State == "stopped" {
-			applyIfHigher(s, 0.5, "EC2 instance is stopped — not running but attached EBS volumes continue to accrue charges")
+		evaluateEC2Structure(res, s)
+	}
+}
+
+// evaluateEC2Structure handles the EC2-specific structural evaluation,
+// separated from evaluateStructure for readability given its branching logic.
+//
+// Decision tree:
+//
+//	state == "stopped"
+//	    → confidence 0.5 (structural idle signal, EBS still billing)
+//
+//	state == "running" AND CPUUtilizationPercent != nil
+//	    cpu < zombieCPUThresholdPercent (2%)
+//	        → confidence 0.85 (zombie: powered on, doing nothing)
+//	    cpu >= zombieCPUThresholdPercent
+//	        → confidence 0.0  (active: force-clear regardless of tag bumps)
+//
+//	state == "running" AND CPUUtilizationPercent == nil
+//	    → no change (CloudWatch data unavailable; stay neutral, don't flag)
+func evaluateEC2Structure(res discovery.Resource, s *Score) {
+	switch res.State {
+
+	case "stopped":
+		applyIfHigher(s, 0.5,
+			"EC2 instance is stopped — not running but attached EBS volumes continue to accrue charges")
+
+	case "running":
+		// CPUUtilizationPercent is nil when the CloudWatch fetch was skipped
+		// or failed (e.g. insufficient IAM permissions). In that case we have
+		// no utilisation evidence either way — leave the score unchanged so
+		// the instance is neither falsely flagged nor falsely cleared.
+		if res.CPUUtilizationPercent == nil {
+			return
+		}
+
+		cpu := *res.CPUUtilizationPercent // safe: nil-checked above
+
+		if cpu < zombieCPUThresholdPercent {
+			// Zombie instance: running but using negligible CPU over the
+			// entire lookback window. applyIfHigher is used so that a
+			// stronger signal from another rule (e.g. a future network-IO
+			// check) can still push the score higher.
+			applyIfHigher(s, zombieConfidence,
+				fmt.Sprintf(
+					"zombie instance: CPU averaged %.2f%% over lookback period (threshold: <%.0f%%)",
+					cpu, zombieCPUThresholdPercent,
+				),
+			)
+		} else {
+			// Active instance: measured CPU proves the instance is doing
+			// real work. Hard-reset to 0.0, overriding any tag bumps.
+			// This is the one place where we use a direct assignment rather
+			// than applyIfHigher — we are asserting "definitely not idle",
+			// not just "less likely to be idle".
+			s.Confidence = activeRunningConfidence
+			s.Reasons = append(s.Reasons,
+				fmt.Sprintf(
+					"instance is active: CPU averaged %.2f%% over lookback period (threshold: ≥%.0f%%)",
+					cpu, zombieCPUThresholdPercent,
+				),
+			)
 		}
 	}
 }
