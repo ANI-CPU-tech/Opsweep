@@ -39,10 +39,15 @@ import (
 //     the attached root EBS volume is accounted for under ResourceTypeEBSVolume)
 
 const (
-	staticEIPMonthly         = 3.60  // unattached Elastic IP
-	staticEBSVolumeMonthly   = 4.00  // unattached 50 GB gp3 volume (representative)
-	staticEC2RunningMonthly  = 30.00 // idle but running t3.medium (representative)
-	staticEC2StoppedMonthly  = 0.00  // stopped EC2 — no compute charge
+	staticEIPMonthly        = 3.60  // unattached Elastic IP
+	staticEBSVolumeMonthly  = 4.00  // unattached 50 GB gp3 volume (representative)
+	staticEC2RunningMonthly = 30.00 // idle but running t3.medium (representative)
+	staticEC2StoppedMonthly = 0.00  // stopped EC2 — no compute charge
+	// NAT Gateway: $0.045/hr × 730 hr/mo = $32.85 → rounded to $32.40.
+	// This covers the fixed hourly charge only; data-processing charges
+	// ($0.045/GB) are excluded because an idle gateway processes no data.
+	// Source: https://aws.amazon.com/vpc/pricing/ (us-east-1, as of 2024)
+	staticNATGatewayMonthly = 32.40 // idle NAT Gateway (hourly charge only)
 )
 
 // CalculateMonthlyWaste returns the estimated monthly USD cost being wasted by
@@ -58,12 +63,13 @@ const (
 //
 // Rules:
 //   - If isIdle is false, returns 0.00 — non-idle resources are not wasted spend.
-//   - EIP unattached:     $3.60/mo  (based on $0.005/hr × 730 hr)
-//   - EBS available:      $4.00/mo  (based on 50 GB gp3 at $0.08/GB-mo)
-//   - EC2 stopped:        $0.00/mo  (AWS charges $0 compute for stopped instances;
+//   - EIP unattached:          $3.60/mo  (based on $0.005/hr × 730 hr)
+//   - EBS available:           $4.00/mo  (based on 50 GB gp3 at $0.08/GB-mo)
+//   - EC2 stopped:             $0.00/mo  (AWS charges $0 compute for stopped instances;
 //     the root EBS cost is captured separately via the EBS volume entry)
-//   - EC2 running (idle): $30.00/mo (based on t3.medium on-demand Linux baseline)
-//   - All other types:    $0.00/mo  (not yet modelled; conservative default)
+//   - EC2 running (idle):      $30.00/mo (based on t3.medium on-demand Linux baseline)
+//   - NAT Gateway (available): $32.40/mo (fixed hourly charge only; $0.045/hr × 720 hr)
+//   - All other types:         $0.00/mo  (not yet modelled; conservative default)
 func CalculateMonthlyWaste(res discovery.Resource, isIdle bool) float64 {
 	if !isIdle {
 		return 0.00
@@ -98,6 +104,14 @@ func CalculateMonthlyWaste(res discovery.Resource, isIdle bool) float64 {
 			// waste. $30.00 is the t3.medium on-demand baseline; real cost
 			// depends on instance type (addressed in Tier 2 Catalog lookup).
 			return staticEC2RunningMonthly
+		}
+	case discovery.ResourceTypeNATGateway:
+		// An available NAT Gateway with zero connections is paying ~$32.40/mo
+		// for the fixed hourly charge alone, routing nothing. We only charge
+		// the baseline here — data-processing costs are zero by definition for
+		// an idle gateway.
+		if res.State == "available" {
+			return staticNATGatewayMonthly
 		}
 	}
 

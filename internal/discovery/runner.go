@@ -13,18 +13,18 @@ import (
 // It drives the entire discovery pipeline:
 //  1. Calls [AWSScannerAPI.ListEnabledRegions] to discover which regions to scan.
 //  2. Spawns one goroutine per region using an [errgroup.Group].
-//  3. Inside each goroutine, fetches EC2 instances, EBS volumes, and Elastic IPs
-//     in parallel sub-goroutines within that region.
+//  3. Inside each goroutine, fetches EC2 instances, EBS volumes, Elastic IPs,
+//     and NAT Gateways in parallel sub-goroutines within that region.
 //  4. Merges all results into a single []Resource slice and returns it.
 //
 // # Concurrency model
 //
 // The outer errgroup spawns N goroutines — one per region. Each goroutine then
 // spawns its own inner errgroup with one goroutine per resource type. This two-
-// level fan-out means a 17-region scan with 3 resource types issues up to 51
-// concurrent API calls. The AWS SDK has built-in retry logic; a separate rate
-// limiter (golang.org/x/time/rate) will be wired in once all resource types are
-// implemented.
+// level fan-out means a 17-region scan with 4 active resource types issues up
+// to 68 concurrent API calls. The AWS SDK has built-in retry logic; a separate
+// rate limiter (golang.org/x/time/rate) will be wired in once all resource
+// types are implemented.
 //
 // # Error handling
 //
@@ -136,8 +136,18 @@ func scanRegion(
 		return nil
 	})
 
-	// TODO: add goroutines for GetEBSSnapshots, GetLoadBalancers,
-	// GetRDSInstances, and GetNATGateways as those methods are implemented.
+	// ── NAT Gateways ──────────────────────────────────────────────────────────
+	innerGroup.Go(func() error {
+		ngws, err := api.GetNATGateways(innerCtx, region)
+		if err != nil {
+			return fmt.Errorf("region %s: %w", region, err)
+		}
+		appendSafe(ngws)
+		return nil
+	})
+
+	// TODO: add goroutines for GetEBSSnapshots, GetLoadBalancers, and
+	// GetRDSInstances as those methods are implemented.
 
 	return innerGroup.Wait()
 }

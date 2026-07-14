@@ -238,11 +238,7 @@ func (s *AWSScanner) GetRDSInstances(ctx context.Context, region string) ([]Reso
 	return nil, nil
 }
 
-// GetNATGateways returns all NAT gateways in the given region.
-// TODO: implement using ec2.NewDescribeNatGatewaysPaginator.
-func (s *AWSScanner) GetNATGateways(ctx context.Context, region string) ([]Resource, error) {
-	return nil, nil
-}
+// GetNATGateways is implemented in natgateway.go.
 
 // ─── Region enumeration ───────────────────────────────────────────────────────
 

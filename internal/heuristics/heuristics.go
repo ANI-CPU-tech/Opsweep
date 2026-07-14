@@ -54,6 +54,14 @@ const (
 	// it to 0.0 overrides any tag-based bumps that may have been applied
 	// earlier, because measured activity is stronger evidence than a tag.
 	activeRunningConfidence = 0.0
+
+	// idleNATGatewayConfidence is the idle confidence score assigned to a NAT
+	// Gateway that has had zero active connections over the entire lookback
+	// window. 0.95 is very high — a gateway with no connections is almost
+	// certainly forgotten — but not 1.0, because a brief maintenance window
+	// or a rarely-used VPN might legitimately show zero connections over 14
+	// days yet still be needed.
+	idleNATGatewayConfidence = 0.95
 )
 
 // ─── Score ────────────────────────────────────────────────────────────────────
@@ -230,14 +238,17 @@ func evaluateTags(res discovery.Resource, s *Score) (skipEvaluation bool) {
 // state rather than inferred behaviour.
 //
 // Signals applied:
-//   - EBS volume in "available" state:   confidence 0.9  (unattached, billing for nothing)
-//   - Elastic IP in "unattached" state:  confidence 1.0  (unambiguous waste — allocated,
+//   - EBS volume in "available" state:        confidence 0.9  (unattached, billing for nothing)
+//   - Elastic IP in "unattached" state:        confidence 1.0  (unambiguous waste — allocated,
 //     not associated, and billing $0.005/hr with zero utility)
-//   - EC2 instance "stopped":            confidence 0.5  (no compute charge, but attached
+//   - EC2 instance "stopped":                 confidence 0.5  (no compute charge, but attached
 //     EBS volumes continue to accrue storage charges)
-//   - EC2 instance "running", CPU < 2%:  confidence 0.85 (zombie — powered on but idle)
-//   - EC2 instance "running", CPU ≥ 2%:  confidence 0.0  (active — force-clear the score)
-//   - EC2 instance "running", no CPU data: no change     (insufficient data, stay neutral)
+//   - EC2 instance "running", CPU < 2%:       confidence 0.85 (zombie — powered on but idle)
+//   - EC2 instance "running", CPU ≥ 2%:       confidence 0.0  (active — force-clear the score)
+//   - EC2 instance "running", no CPU data:    no change       (insufficient data, stay neutral)
+//   - NAT Gateway "available", connections=0: confidence 0.95 (idle gateway, fixed hourly charge)
+//   - NAT Gateway "available", connections>0: no change       (actively routing traffic)
+//   - NAT Gateway "available", no conn data:  no change       (insufficient data, stay neutral)
 //
 // The structural confidence replaces (rather than adds to) any prior confidence
 // from tag bumps — but only when it is higher — so a hackathon-tagged stopped
@@ -260,6 +271,9 @@ func evaluateStructure(res discovery.Resource, s *Score) {
 
 	case discovery.ResourceTypeEC2Instance:
 		evaluateEC2Structure(res, s)
+
+	case discovery.ResourceTypeNATGateway:
+		evaluateNATGatewayStructure(res, s)
 	}
 }
 
@@ -323,6 +337,46 @@ func evaluateEC2Structure(res discovery.Resource, s *Score) {
 			)
 		}
 	}
+}
+
+// evaluateNATGatewayStructure handles NAT Gateway idle detection.
+//
+// Decision tree:
+//
+//	state == "available" AND ConnectionCount != nil
+//	    *ConnectionCount == 0
+//	        → confidence 0.95 (idle: paying hourly, routing nothing)
+//	    *ConnectionCount > 0
+//	        → no change (actively routing — don't flag)
+//
+//	state == "available" AND ConnectionCount == nil
+//	    → no change (CloudWatch data unavailable; stay neutral)
+//
+//	any other state ("deleting", "deleted", "pending", "failed")
+//	    → no change (already leaving service; not actionable)
+//
+// Note: we use strict equality (*ConnectionCount == 0) rather than a threshold
+// because ActiveConnectionCount is a Sum metric — even a single connection per
+// day produces a non-zero value. Any non-zero sum means real traffic occurred.
+func evaluateNATGatewayStructure(res discovery.Resource, s *Score) {
+	if res.State != "available" {
+		return
+	}
+
+	// ConnectionCount nil means the CloudWatch fetch was skipped or failed.
+	// Stay neutral — don't flag or clear the score.
+	if res.ConnectionCount == nil {
+		return
+	}
+
+	if *res.ConnectionCount == 0 {
+		applyIfHigher(s, idleNATGatewayConfidence,
+			"idle NAT Gateway: 0 active connections over lookback period — paying hourly charge with no traffic routed",
+		)
+	}
+	// Non-zero connections: gateway is routing traffic. Leave the score
+	// unchanged rather than force-clearing it, because a tag bump (e.g.
+	// temp=true) should still be visible to the user even for active gateways.
 }
 
 // evaluateAge adds ageBump to the confidence score when the resource's

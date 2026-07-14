@@ -98,6 +98,19 @@ type Resource struct {
 	//
 	// Consumers must nil-check before dereferencing.
 	CPUUtilizationPercent *float64
+
+	// ConnectionCount is the average daily active-connection count over the
+	// heuristics lookback window, fetched from CloudWatch.
+	//
+	// A pointer distinguishes two states:
+	//   - nil  → metric was not fetched (resource type doesn't emit it, or
+	//             the fetch failed / was skipped).
+	//   - 0.0  → fetch succeeded and the gateway had zero active connections
+	//             across the entire lookback window (strong idle signal).
+	//
+	// Currently populated for NAT Gateways (AWS/NATGateway ActiveConnectionCount).
+	// Consumers must nil-check before dereferencing.
+	ConnectionCount *float64
 }
 
 // ─── Mockable interface ───────────────────────────────────────────────────────

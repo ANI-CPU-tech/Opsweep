@@ -111,6 +111,78 @@ func FetchEC2CPUUtilization(
 	return averageDatapoints(output.Datapoints), nil
 }
 
+// FetchNatGatewayConnections queries CloudWatch for the ActiveConnectionCount
+// metric of a single NAT Gateway over the last `days` days.
+//
+// ActiveConnectionCount is a Sum statistic — AWS emits the total number of
+// active connections observed during each period bucket. With Period=86400 we
+// get one data point per day representing the daily connection total. We then
+// average those daily sums to produce a single "mean daily connections" figure.
+//
+// # Return values
+//
+//   - (avg, nil)  — data available; avg is the mean daily connection count.
+//   - (0.0, nil)  — no data points returned for the window. This typically
+//     means the NAT gateway had zero traffic (CloudWatch omits zero-value
+//     data points for Sum metrics). The caller should store aws.Float64(0.0)
+//     to distinguish "confirmed zero" from "fetch not attempted" (nil).
+//   - (0.0, err)  — the CloudWatch API call failed.
+//
+// # Why Sum instead of Average?
+//
+// ActiveConnectionCount is published by AWS as a Sum metric, not an Average.
+// Requesting Statistics=["Average"] on a Sum metric returns per-sample averages
+// within the period, which is misleading for connection counting. Sum gives us
+// the total connections seen per day, which is what we need to identify a
+// gateway that handled zero traffic.
+func FetchNatGatewayConnections(
+	ctx context.Context,
+	cfg aws.Config,
+	natGatewayID string,
+	region string,
+	days int,
+) (float64, error) {
+	if natGatewayID == "" {
+		return 0, fmt.Errorf("cloudwatch: FetchNatGatewayConnections called with empty natGatewayID")
+	}
+	if days <= 0 {
+		return 0, fmt.Errorf("cloudwatch: days must be > 0, got %d", days)
+	}
+
+	regionalCfg := cfg.Copy()
+	regionalCfg.Region = region
+	client := cloudwatch.NewFromConfig(regionalCfg)
+
+	now := time.Now().UTC()
+	startTime := now.Add(-time.Duration(days) * 24 * time.Hour)
+
+	input := &cloudwatch.GetMetricStatisticsInput{
+		Namespace:  aws.String("AWS/NATGateway"),
+		MetricName: aws.String("ActiveConnectionCount"),
+
+		// NatGatewayId dimension scopes the metric to a specific gateway.
+		Dimensions: []cwtypes.Dimension{
+			{
+				Name:  aws.String("NatGatewayId"),
+				Value: aws.String(natGatewayID),
+			},
+		},
+
+		StartTime:  aws.Time(startTime),
+		EndTime:    aws.Time(now),
+		Period:     aws.Int32(cwPeriodSeconds),
+		Statistics: []cwtypes.Statistic{cwtypes.StatisticSum},
+	}
+
+	output, err := client.GetMetricStatistics(ctx, input)
+	if err != nil {
+		return 0, fmt.Errorf("cloudwatch: GetMetricStatistics (ActiveConnectionCount) for %s in %s: %w",
+			natGatewayID, region, err)
+	}
+
+	return sumDatapoints(output.Datapoints), nil
+}
+
 // averageDatapoints calculates the arithmetic mean of the Average field across
 // all returned CloudWatch Datapoint values.
 //
@@ -145,4 +217,39 @@ func averageDatapoints(datapoints []cwtypes.Datapoint) float64 {
 		return 0.0
 	}
 	return sum / float64(count)
+}
+
+// sumDatapoints calculates the arithmetic mean of the Sum field across all
+// returned CloudWatch Datapoint values.
+//
+// Used for metrics published as Sum statistics (e.g. ActiveConnectionCount).
+// Each data point holds the total count for its period bucket; averaging them
+// gives "mean daily total", which is the right signal for idle detection:
+// a gateway with a mean daily sum of 0 had zero connections every single day.
+//
+// Returns 0.0 when the slice is empty. CloudWatch omits data points for Sum
+// metrics when the value is zero for an entire period, so an empty slice is
+// itself evidence of zero activity — the caller should record aws.Float64(0.0)
+// rather than nil in the Resource field to capture that distinction.
+func sumDatapoints(datapoints []cwtypes.Datapoint) float64 {
+	if len(datapoints) == 0 {
+		return 0.0
+	}
+
+	var total float64
+	var count int
+
+	for _, dp := range datapoints {
+		// dp.Sum is *float64; skip nil entries defensively.
+		if dp.Sum == nil {
+			continue
+		}
+		total += *dp.Sum
+		count++
+	}
+
+	if count == 0 {
+		return 0.0
+	}
+	return total / float64(count)
 }
