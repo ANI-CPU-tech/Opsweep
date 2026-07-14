@@ -85,6 +85,19 @@ type Resource struct {
 	// The zero value indicates that the creation time was not available
 	// (some resource types omit it).
 	CreationTime time.Time
+
+	// CPUUtilizationPercent is the average CPU utilisation over the heuristics
+	// lookback window, as a percentage (0.0–100.0), fetched from CloudWatch.
+	//
+	// A pointer is used deliberately to distinguish two different states:
+	//   - nil  → CloudWatch data was not fetched for this resource (e.g. the
+	//             resource type does not emit this metric, or the fetch was
+	//             skipped for a stopped/non-EC2 resource).
+	//   - 0.0  → Data was fetched and the instance genuinely used 0% CPU
+	//             across the entire lookback window (a strong zombie signal).
+	//
+	// Consumers must nil-check before dereferencing.
+	CPUUtilizationPercent *float64
 }
 
 // ─── Mockable interface ───────────────────────────────────────────────────────
