@@ -48,6 +48,11 @@ const (
 	// ($0.045/GB) are excluded because an idle gateway processes no data.
 	// Source: https://aws.amazon.com/vpc/pricing/ (us-east-1, as of 2024)
 	staticNATGatewayMonthly = 32.40 // idle NAT Gateway (hourly charge only)
+	// RDS db.t3.micro on-demand Linux/MySQL: ~$0.017/hr × 730 hr/mo ≈ $12.41,
+	// plus minimal storage; rounded up to $14.60 to include a 20 GB gp2
+	// root volume ($0.115/GB-mo × 20 GB = $2.30). Source: aws.amazon.com/rds/
+	// pricing/ (us-east-1, Single-AZ, as of 2024).
+	staticRDSInstanceMonthly = 14.60 // idle db.t3.micro + 20 GB storage (representative)
 )
 
 // CalculateMonthlyWaste returns the estimated monthly USD cost being wasted by
@@ -69,6 +74,7 @@ const (
 //     the root EBS cost is captured separately via the EBS volume entry)
 //   - EC2 running (idle):      $30.00/mo (based on t3.medium on-demand Linux baseline)
 //   - NAT Gateway (available): $32.40/mo (fixed hourly charge only; $0.045/hr × 720 hr)
+//   - RDS (available):         $14.60/mo (db.t3.micro + 20 GB gp2; representative baseline)
 //   - All other types:         $0.00/mo  (not yet modelled; conservative default)
 func CalculateMonthlyWaste(res discovery.Resource, isIdle bool) float64 {
 	if !isIdle {
@@ -105,6 +111,15 @@ func CalculateMonthlyWaste(res discovery.Resource, isIdle bool) float64 {
 			// depends on instance type (addressed in Tier 2 Catalog lookup).
 			return staticEC2RunningMonthly
 		}
+	case discovery.ResourceTypeRDSInstance:
+		// An available RDS instance with zero connections is paying instance
+		// hours and storage costs with no client activity. $14.60 covers a
+		// db.t3.micro with a 20 GB gp2 volume — real cost scales with instance
+		// class and storage, addressable in the Tier 2 Catalog lookup.
+		if res.State == "available" {
+			return staticRDSInstanceMonthly
+		}
+
 	case discovery.ResourceTypeNATGateway:
 		// An available NAT Gateway with zero connections is paying ~$32.40/mo
 		// for the fixed hourly charge alone, routing nothing. We only charge

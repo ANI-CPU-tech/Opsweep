@@ -111,6 +111,74 @@ func FetchEC2CPUUtilization(
 	return averageDatapoints(output.Datapoints), nil
 }
 
+// FetchRDSConnections queries CloudWatch for the average DatabaseConnections
+// count for a single RDS instance over the last `days` days.
+//
+// DatabaseConnections is published by AWS as an Average statistic, representing
+// the mean number of client connections during each period bucket. With
+// Period=86400 we get one data point per day. We then average those daily
+// values to produce a single "mean daily connections" figure.
+//
+// A return value of 0.0 with a nil error means either:
+//   - The API returned data points and all averages were genuinely 0.0
+//     (database had no connections — a strong idle signal), or
+//   - The API returned no data points at all (database was stopped for the
+//     entire window, or it is newly created and has no history yet).
+//
+// The caller should store aws.Float64(0.0) in both cases so the heuristics
+// engine sees "confirmed zero" rather than nil ("data not fetched").
+func FetchRDSConnections(
+	ctx context.Context,
+	cfg aws.Config,
+	dbIdentifier string,
+	region string,
+	days int,
+) (float64, error) {
+	if dbIdentifier == "" {
+		return 0, fmt.Errorf("cloudwatch: FetchRDSConnections called with empty dbIdentifier")
+	}
+	if days <= 0 {
+		return 0, fmt.Errorf("cloudwatch: days must be > 0, got %d", days)
+	}
+
+	regionalCfg := cfg.Copy()
+	regionalCfg.Region = region
+	client := cloudwatch.NewFromConfig(regionalCfg)
+
+	now := time.Now().UTC()
+	startTime := now.Add(-time.Duration(days) * 24 * time.Hour)
+
+	input := &cloudwatch.GetMetricStatisticsInput{
+		Namespace:  aws.String("AWS/RDS"),
+		MetricName: aws.String("DatabaseConnections"),
+
+		// DBInstanceIdentifier scopes the metric to a single RDS instance.
+		// Without this dimension the query returns aggregate data across all
+		// RDS instances in the region.
+		Dimensions: []cwtypes.Dimension{
+			{
+				Name:  aws.String("DBInstanceIdentifier"),
+				Value: aws.String(dbIdentifier),
+			},
+		},
+
+		StartTime:  aws.Time(startTime),
+		EndTime:    aws.Time(now),
+		Period:     aws.Int32(cwPeriodSeconds),
+		Statistics: []cwtypes.Statistic{cwtypes.StatisticAverage},
+	}
+
+	output, err := client.GetMetricStatistics(ctx, input)
+	if err != nil {
+		return 0, fmt.Errorf("cloudwatch: GetMetricStatistics (DatabaseConnections) for %s in %s: %w",
+			dbIdentifier, region, err)
+	}
+
+	// averageDatapoints reads dp.Average, which matches the Average statistic
+	// requested above — no separate helper needed.
+	return averageDatapoints(output.Datapoints), nil
+}
+
 // FetchNatGatewayConnections queries CloudWatch for the ActiveConnectionCount
 // metric of a single NAT Gateway over the last `days` days.
 //

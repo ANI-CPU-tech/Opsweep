@@ -111,6 +111,19 @@ type Resource struct {
 	// Currently populated for NAT Gateways (AWS/NATGateway ActiveConnectionCount).
 	// Consumers must nil-check before dereferencing.
 	ConnectionCount *float64
+
+	// DatabaseConnections is the average daily connection count over the
+	// heuristics lookback window, fetched from CloudWatch.
+	//
+	// A pointer distinguishes two states:
+	//   - nil  → metric was not fetched (resource type doesn't emit it, or
+	//             the fetch failed / was skipped for a non-RDS resource).
+	//   - 0.0  → fetch succeeded and the database had zero connections across
+	//             the entire lookback window (strong idle signal).
+	//
+	// Currently populated for RDS instances (AWS/RDS DatabaseConnections).
+	// Consumers must nil-check before dereferencing.
+	DatabaseConnections *float64
 }
 
 // ─── Mockable interface ───────────────────────────────────────────────────────

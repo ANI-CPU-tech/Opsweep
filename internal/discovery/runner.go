@@ -21,8 +21,8 @@ import (
 //
 // The outer errgroup spawns N goroutines — one per region. Each goroutine then
 // spawns its own inner errgroup with one goroutine per resource type. This two-
-// level fan-out means a 17-region scan with 4 active resource types issues up
-// to 68 concurrent API calls. The AWS SDK has built-in retry logic; a separate
+// level fan-out means a 17-region scan with 5 active resource types issues up
+// to 85 concurrent API calls. The AWS SDK has built-in retry logic; a separate
 // rate limiter (golang.org/x/time/rate) will be wired in once all resource
 // types are implemented.
 //
@@ -146,8 +146,18 @@ func scanRegion(
 		return nil
 	})
 
-	// TODO: add goroutines for GetEBSSnapshots, GetLoadBalancers, and
-	// GetRDSInstances as those methods are implemented.
+	// ── RDS instances ─────────────────────────────────────────────────────────
+	innerGroup.Go(func() error {
+		dbs, err := api.GetRDSInstances(innerCtx, region)
+		if err != nil {
+			return fmt.Errorf("region %s: %w", region, err)
+		}
+		appendSafe(dbs)
+		return nil
+	})
+
+	// TODO: add goroutines for GetEBSSnapshots and GetLoadBalancers as those
+	// methods are implemented.
 
 	return innerGroup.Wait()
 }

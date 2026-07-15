@@ -62,6 +62,13 @@ const (
 	// or a rarely-used VPN might legitimately show zero connections over 14
 	// days yet still be needed.
 	idleNATGatewayConfidence = 0.95
+
+	// idleRDSConfidence is the idle confidence score assigned to an RDS
+	// instance that has had zero average connections over the entire lookback
+	// window. 0.95 mirrors the NAT Gateway signal strength — a database with
+	// no connections is almost certainly abandoned, but 1.0 would be too
+	// aggressive given that some batch jobs run less frequently than 14 days.
+	idleRDSConfidence = 0.95
 )
 
 // ─── Score ────────────────────────────────────────────────────────────────────
@@ -249,6 +256,9 @@ func evaluateTags(res discovery.Resource, s *Score) (skipEvaluation bool) {
 //   - NAT Gateway "available", connections=0: confidence 0.95 (idle gateway, fixed hourly charge)
 //   - NAT Gateway "available", connections>0: no change       (actively routing traffic)
 //   - NAT Gateway "available", no conn data:  no change       (insufficient data, stay neutral)
+//   - RDS "available", connections=0:         confidence 0.95 (idle database, still billing)
+//   - RDS "available", connections>0:         no change       (actively serving queries)
+//   - RDS "available", no conn data:          no change       (insufficient data, stay neutral)
 //
 // The structural confidence replaces (rather than adds to) any prior confidence
 // from tag bumps — but only when it is higher — so a hackathon-tagged stopped
@@ -274,6 +284,9 @@ func evaluateStructure(res discovery.Resource, s *Score) {
 
 	case discovery.ResourceTypeNATGateway:
 		evaluateNATGatewayStructure(res, s)
+
+	case discovery.ResourceTypeRDSInstance:
+		evaluateRDSStructure(res, s)
 	}
 }
 
@@ -377,6 +390,46 @@ func evaluateNATGatewayStructure(res discovery.Resource, s *Score) {
 	// Non-zero connections: gateway is routing traffic. Leave the score
 	// unchanged rather than force-clearing it, because a tag bump (e.g.
 	// temp=true) should still be visible to the user even for active gateways.
+}
+
+// evaluateRDSStructure handles RDS instance idle detection.
+//
+// Decision tree:
+//
+//	state == "available" AND DatabaseConnections != nil
+//	    *DatabaseConnections == 0
+//	        → confidence 0.95 (idle: paying hourly, zero clients connected)
+//	    *DatabaseConnections > 0
+//	        → no change (actively serving queries — don't flag)
+//
+//	state == "available" AND DatabaseConnections == nil
+//	    → no change (CloudWatch data unavailable; stay neutral)
+//
+//	any other state ("stopped", "backing-up", "modifying", etc.)
+//	    → no change (transient or already inactive; not actionable)
+//
+// We use strict equality (*DatabaseConnections == 0) rather than a threshold
+// because DatabaseConnections is an Average statistic — even a single
+// connection per day raises the average above zero. Any non-zero mean means
+// real client activity occurred during the lookback window.
+func evaluateRDSStructure(res discovery.Resource, s *Score) {
+	if res.State != "available" {
+		return
+	}
+
+	// DatabaseConnections nil means the CloudWatch fetch was skipped or failed.
+	// Stay neutral — don't flag or clear the score.
+	if res.DatabaseConnections == nil {
+		return
+	}
+
+	if *res.DatabaseConnections == 0 {
+		applyIfHigher(s, idleRDSConfidence,
+			"idle RDS database: 0 average connections over lookback period — paying instance hours with no client activity",
+		)
+	}
+	// Non-zero connections: database is serving queries. Leave the score
+	// unchanged — same reasoning as evaluateNATGatewayStructure.
 }
 
 // evaluateAge adds ageBump to the confidence score when the resource's

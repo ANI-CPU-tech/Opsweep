@@ -232,11 +232,7 @@ func (s *AWSScanner) GetLoadBalancers(ctx context.Context, region string) ([]Res
 	return nil, nil
 }
 
-// GetRDSInstances returns all RDS database instances in the given region.
-// TODO: implement using rds.NewDescribeDBInstancesPaginator.
-func (s *AWSScanner) GetRDSInstances(ctx context.Context, region string) ([]Resource, error) {
-	return nil, nil
-}
+// GetRDSInstances is implemented in rds.go.
 
 // GetNATGateways is implemented in natgateway.go.
 
