@@ -1,27 +1,27 @@
 // Package cli implements the interactive REPL shell for OpsSweep.
 //
-// Rather than a traditional CLI with subcommands and flags, OpsSweep runs as
-// a persistent interactive session inspired by tools like Claude Code. The
-// user types commands at a prompt (/scan, /report, /teardown) and the tool
-// responds immediately without re-initializing AWS credentials or re-parsing
-// configuration on every invocation.
+// The shell uses github.com/c-bata/go-prompt to provide a real-time
+// autocomplete dropdown as the user types — the same UX pattern used by
+// tools like Claude Code and kube-prompt. go-prompt takes over stdin/stdout
+// in raw terminal mode, so the bufio.Scanner approach is replaced entirely.
 //
-// This design has three benefits:
-//  1. Faster iteration: AWS config is loaded once, not on every command.
-//  2. Better UX: stateful context (last scan results, selected resources) can
-//     be preserved across commands within a single session.
-//  3. Discoverability: /help is always available; users explore by typing
-//     rather than reading man pages.
+// Architecture:
+//   - [completer] supplies dropdown suggestions filtered by prefix as the user
+//     types. It is called by go-prompt on every keystroke.
+//   - [executor] receives the confirmed input string when the user presses
+//     Enter. It trims, tokenises, and dispatches to command handlers.
+//   - [Start] prints the banner, then hands control to prompt.New(...).Run(),
+//     which owns the event loop for the rest of the session.
 package cli
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"os"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	goprompt "github.com/c-bata/go-prompt"
 
 	"github.com/anirudh/opssweep/internal/discovery"
 	"github.com/anirudh/opssweep/internal/remediation"
@@ -30,6 +30,8 @@ import (
 )
 
 // ANSI escape codes for styled terminal output.
+// go-prompt renders the prompt prefix itself, so these are only used inside
+// executor output — not in the prompt string.
 const (
 	ansiCyan   = "\033[36m"
 	ansiRed    = "\033[31m"
@@ -40,62 +42,62 @@ const (
 	ansiBold   = "\033[1m"
 )
 
-// Start launches the interactive OpsSweep shell (REPL).
+// suggestions is the static list of all commands shown in the autocomplete
+// dropdown. go-prompt calls completer on every keystroke; completer filters
+// this slice by the prefix the user has typed so far.
+var suggestions = []goprompt.Suggest{
+	{Text: "/scan", Description: "Find idle resources. Pass --teardown to delete."},
+	{Text: "/report", Description: "Generate an HTML cost report."},
+	{Text: "/clear", Description: "Clear the terminal screen."},
+	{Text: "/help", Description: "List all commands."},
+	{Text: "/exit", Description: "Exit the application."},
+}
+
+// completer is the go-prompt Completer. It is called on every keystroke and
+// returns the subset of suggestions whose Text begins with whatever the user
+// has typed before the cursor.
 //
-// The shell prints the premium bordered banner once on startup, then enters
-// an infinite loop reading commands from stdin. The AWS config and context are
-// passed in once at session start and reused across all commands — no
-// re-authentication required.
+// ignoreCase=true means "/SC" still matches "/scan", which feels natural.
+func completer(d goprompt.Document) []goprompt.Suggest {
+	return goprompt.FilterHasPrefix(suggestions, d.GetWordBeforeCursor(), true)
+}
+
+// Start prints the banner and launches the interactive go-prompt session.
 //
-// # Input parsing
-//
-// Each line of input is split into tokens via strings.Fields. The first token
-// is the command (e.g. "/scan"); remaining tokens are treated as arguments
-// (e.g. "--teardown", "--output=report.html"). This mirrors how real shells
-// tokenise input without requiring a full flag parser.
-//
-// # Exit conditions
-//
-// The loop runs until:
-//   - The user types /exit or quit
-//   - stdin closes (EOF, e.g. piped input exhausted or Ctrl+D in terminal)
-//   - An unrecoverable read error occurs
-//
-// Normal command errors (AWS API failures, file write errors) are caught,
-// logged to stderr, and do NOT terminate the session.
+// go-prompt.Run() takes over the terminal in raw mode and blocks until the
+// process exits. The executor closure captures ctx and cfg so every command
+// handler has access to the AWS session without global variables.
 func Start(ctx context.Context, cfg aws.Config) {
-	// Print the premium bordered banner once at session start.
 	ui.PrintBanner()
 
-	lineScanner := bufio.NewScanner(os.Stdin)
-
-	for {
-		fmt.Print(ansiDim + "> " + ansiReset)
-
-		if !lineScanner.Scan() {
-			break
-		}
-
-		// Split into tokens. strings.Fields handles multiple spaces and tabs,
-		// and returns an empty slice for blank lines — no panic risk.
-		args := strings.Fields(lineScanner.Text())
-
-		// Empty line: re-show the prompt without any output.
+	// executor is the go-prompt Executor. It is called with the full input
+	// line string each time the user presses Enter.
+	//
+	// It is defined as a closure here so it captures ctx and cfg by reference,
+	// making them available to every command handler without threading them
+	// through global state.
+	executor := func(input string) {
+		// Tokenise: strings.Fields splits on any whitespace and returns []
+		// for blank input, so there is no index-out-of-bounds risk.
+		args := strings.Fields(input)
 		if len(args) == 0 {
-			continue
+			return
 		}
 
-		command := args[0]  // e.g. "/scan"
-		flags := args[1:]   // e.g. ["--teardown"] or []
+		command := args[0] // e.g. "/scan"
+		flags := args[1:]  // e.g. ["--teardown"] or []
 
-		// ── Command dispatch ──────────────────────────────────────────────────
 		switch command {
 
 		case "/exit", "quit":
+			// go-prompt owns the event loop so we cannot simply return here —
+			// we must call os.Exit to terminate the process. A clean farewell
+			// message is printed before exiting.
 			fmt.Println(ansiGreen + "✓ " + ansiReset + "Goodbye! Session ended.")
-			return
+			os.Exit(0)
 
 		case "/clear":
+			// \033[H — move cursor to home. \033[2J — erase entire display.
 			fmt.Print("\033[H\033[2J")
 			ui.PrintBanner()
 
@@ -112,16 +114,37 @@ func Start(ctx context.Context, cfg aws.Config) {
 			fmt.Println(ansiDim + "Unknown command. Type /help" + ansiReset)
 		}
 
+		// Blank line between command output and the next prompt.
 		fmt.Println()
 	}
 
-	if err := lineScanner.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, ansiRed+"[ERROR]"+ansiReset+" Failed to read input: %v\n", err)
-	}
+	// Build and run the prompt engine.
+	// OptionPrefix sets the prompt string shown to the left of the cursor.
+	// OptionTitle sets the terminal window/tab title (visible in most terminals).
+	// The color options style the dropdown to match the amber/dark theme.
+	p := goprompt.New(
+		executor,
+		completer,
+		goprompt.OptionPrefix("> "),
+		goprompt.OptionTitle("OpsSweep"),
+		// Dropdown background — dark so it contrasts with the terminal.
+		goprompt.OptionSuggestionBGColor(goprompt.DarkGray),
+		goprompt.OptionSuggestionTextColor(goprompt.White),
+		// Highlighted (selected) row in the dropdown.
+		goprompt.OptionSelectedSuggestionBGColor(goprompt.Brown),
+		goprompt.OptionSelectedSuggestionTextColor(goprompt.White),
+		// Description column (right side of each suggestion row).
+		goprompt.OptionDescriptionBGColor(goprompt.DarkGray),
+		goprompt.OptionDescriptionTextColor(goprompt.LightGray),
+		goprompt.OptionSelectedDescriptionBGColor(goprompt.Brown),
+		goprompt.OptionSelectedDescriptionTextColor(goprompt.White),
+	)
+	p.Run()
 }
 
-// hasFlag reports whether a specific flag string is present in the args slice.
-// A linear scan is fine — the number of flags is always tiny.
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+// hasFlag reports whether flag is present anywhere in args.
 func hasFlag(args []string, flag string) bool {
 	for _, a := range args {
 		if a == flag {
@@ -132,10 +155,8 @@ func hasFlag(args []string, flag string) bool {
 }
 
 // scanResources runs the multi-region discovery pipeline and returns the raw
-// resource slice. It is shared by runScan and runReport to avoid duplicating
-// the scanner initialisation and error handling.
-//
-// Returns nil on any error; the error has already been written to stderr.
+// resource slice. On error it writes to stderr and returns nil; callers check
+// for nil before proceeding.
 func scanResources(ctx context.Context, cfg aws.Config) []discovery.Resource {
 	fmt.Println(ansiCyan + "[SYSTEM] Scanning AWS regions for idle resources. This may take a moment..." + ansiReset)
 	fmt.Println()
@@ -153,58 +174,43 @@ func scanResources(ctx context.Context, cfg aws.Config) []discovery.Resource {
 	return resources
 }
 
-// runScan executes a full discovery scan and either:
-//   - (default) prints the waste report table to stdout, or
-//   - (--teardown) prints the report AND runs live deletion via the Remediator.
-//
-// The Remediator.Process call receives the full resource slice and handles its
-// own confidence filtering internally (threshold: 0.90). There is no need to
-// loop and call it per-resource — that would bypass its own queuing logic.
+// runScan executes a full discovery scan, prints the waste table, and
+// optionally runs live deletion when --teardown is present.
 func runScan(ctx context.Context, cfg aws.Config, flags []string) {
 	resources := scanResources(ctx, cfg)
 	if resources == nil {
-		return // error already printed
+		return
 	}
 
-	// Always print the waste table so the user can see what was found.
 	if err := ui.PrintWasteReport(os.Stdout, resources); err != nil {
 		fmt.Fprintf(os.Stderr, ansiRed+"[ERROR]"+ansiReset+" Failed to render report: %v\n", err)
 		return
 	}
 
-	// ── Teardown pass (opt-in) ────────────────────────────────────────────────
 	if !hasFlag(flags, "--teardown") {
 		return
 	}
 
-	// Live teardown: warn loudly before making any mutating AWS API calls.
 	fmt.Println()
 	fmt.Println(ansiRed + "[WARNING] Executing live teardown. Resources will be permanently deleted." + ansiReset)
 	fmt.Println()
 
-	// Process accepts the full slice and applies the 0.90 confidence threshold
-	// internally. isDryRun=false triggers real AWS deletion API calls.
+	// Process takes the full slice and applies the 0.90 confidence threshold
+	// internally. isDryRun=false means real AWS deletion API calls are made.
 	remediator := remediation.NewRemediator(cfg)
 	if err := remediator.Process(ctx, resources, false); err != nil {
 		fmt.Fprintf(os.Stderr, ansiRed+"[ERROR]"+ansiReset+" Teardown failed: %v\n", err)
 	}
 }
 
-// runReport executes a full discovery scan and writes a self-contained HTML
-// FinOps audit report to disk. The output path defaults to "audit.html" but
-// can be overridden with --output=<path>.
-//
-// Example:
-//
-//	/report
-//	/report --output=reports/2024-q1.html
+// runReport executes a full discovery scan and writes an HTML audit report.
+// The output path defaults to "audit.html"; pass --output=<path> to override.
 func runReport(ctx context.Context, cfg aws.Config, flags []string) {
 	resources := scanResources(ctx, cfg)
 	if resources == nil {
-		return // error already printed
+		return
 	}
 
-	// Determine output path: default to "audit.html", allow override.
 	outputPath := "audit.html"
 	for _, f := range flags {
 		if strings.HasPrefix(f, "--output=") {
@@ -220,7 +226,7 @@ func runReport(ctx context.Context, cfg aws.Config, flags []string) {
 	fmt.Println(ansiGreen + "[REPORT] Successfully generated FinOps audit at " + outputPath + ansiReset)
 }
 
-// printHelp writes a formatted, two-column list of available commands to stdout.
+// printHelp writes a formatted two-column command reference to stdout.
 func printHelp() {
 	fmt.Println(ansiBold + "Available Commands:" + ansiReset)
 	fmt.Println()
