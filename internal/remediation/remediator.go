@@ -169,8 +169,9 @@ func (r *Remediator) deleteResource(
 		return r.deleteEBSVolume(ctx, res, waste)
 	case discovery.ResourceTypeNATGateway:
 		return r.deleteNATGateway(ctx, res, waste)
+	case discovery.ResourceTypeRDSInstance:
+		return r.deleteRDSInstance(ctx, res, waste)
 	// TODO: case discovery.ResourceTypeEC2Instance: return r.terminateEC2(ctx, res)
-	// TODO: case discovery.ResourceTypeRDSInstance: return r.deleteRDSInstance(ctx, res)
 
 	default:
 		// Deletion not yet implemented for this resource type.
@@ -248,6 +249,29 @@ func (r *Remediator) deleteNATGateway(
 	// Print success message in green
 	fmt.Fprintf(os.Stdout,
 		"%s[TEARDOWN]%s Successfully deleted NAT Gateway %s in %s\n",
+		ansiGreen,
+		ansiReset,
+		res.ID,
+		res.Region,
+	)
+
+	return nil
+}
+
+// deleteRDSInstance deletes an idle RDS database instance using the DeleteRDSInstance function.
+// On success, prints a green confirmation line to stdout.
+// On failure, returns an error which the caller will log to stderr.
+func (r *Remediator) deleteRDSInstance(
+	ctx context.Context,
+	res discovery.Resource,
+	waste float64,
+) error {
+	if err := DeleteRDSInstance(ctx, r.cfg, res.ID, res.Region); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stdout,
+		"%s[TEARDOWN]%s Successfully deleted RDS Database %s in %s\n",
 		ansiGreen,
 		ansiReset,
 		res.ID,
