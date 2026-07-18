@@ -163,7 +163,8 @@ func (r *Remediator) deleteResource(
 	waste float64,
 ) error {
 	switch res.Type {
-	// TODO: case discovery.ResourceTypeElasticIP: return r.deleteEIP(ctx, res)
+	case discovery.ResourceTypeElasticIP:
+		return r.deleteElasticIP(ctx, res, waste)
 	case discovery.ResourceTypeEBSVolume:
 		return r.deleteEBSVolume(ctx, res, waste)
 	// TODO: case discovery.ResourceTypeEC2Instance: return r.terminateEC2(ctx, res)
@@ -198,6 +199,30 @@ func (r *Remediator) deleteEBSVolume(
 	// Print success message in green
 	fmt.Fprintf(os.Stdout,
 		"%s[TEARDOWN]%s Successfully deleted EBS volume %s in %s\n",
+		ansiGreen,
+		ansiReset,
+		res.ID,
+		res.Region,
+	)
+
+	return nil
+}
+
+// deleteElasticIP releases an unattached Elastic IP using the ReleaseElasticIP function.
+// On success, prints a green confirmation line to stdout.
+// On failure, returns an error which the caller will log to stderr.
+func (r *Remediator) deleteElasticIP(
+	ctx context.Context,
+	res discovery.Resource,
+	waste float64,
+) error {
+	if err := ReleaseElasticIP(ctx, r.cfg, res.ID, res.Region); err != nil {
+		return err
+	}
+
+	// Print success message in green
+	fmt.Fprintf(os.Stdout,
+		"%s[TEARDOWN]%s Successfully released Elastic IP %s in %s\n",
 		ansiGreen,
 		ansiReset,
 		res.ID,
