@@ -42,6 +42,7 @@ const remediationConfidenceThreshold = 0.90
 const (
 	ansiYellow = "\033[33m"
 	ansiRed    = "\033[31m"
+	ansiGreen  = "\033[32m"
 	ansiReset  = "\033[0m"
 	ansiBold   = "\033[1m"
 )
@@ -163,20 +164,45 @@ func (r *Remediator) deleteResource(
 ) error {
 	switch res.Type {
 	// TODO: case discovery.ResourceTypeElasticIP: return r.deleteEIP(ctx, res)
-	// TODO: case discovery.ResourceTypeEBSVolume: return r.deleteEBSVolume(ctx, res)
+	case discovery.ResourceTypeEBSVolume:
+		return r.deleteEBSVolume(ctx, res, waste)
 	// TODO: case discovery.ResourceTypeEC2Instance: return r.terminateEC2(ctx, res)
 	// TODO: case discovery.ResourceTypeNATGateway: return r.deleteNATGateway(ctx, res)
 	// TODO: case discovery.ResourceTypeRDSInstance: return r.deleteRDSInstance(ctx, res)
 
 	default:
 		// Deletion not yet implemented for this resource type.
-		// Print the dry-run line so the operator sees what would be done.
+		// Print a skip message so the operator knows this type isn't handled yet.
 		fmt.Fprintf(os.Stdout,
-			"%s%s[DRY RUN]%s Would delete %s: %s (Waste: $%.2f/mo) %s[NOT YET IMPLEMENTED]%s\n",
-			ansiBold, ansiYellow, ansiReset,
-			res.Type, res.ID, waste,
-			ansiRed, ansiReset,
+			"%s[SKIP]%s Teardown not yet implemented for %s\n",
+			ansiYellow,
+			ansiReset,
+			res.Type,
 		)
 		return nil
 	}
+}
+
+// deleteEBSVolume deletes an unattached EBS volume using the DeleteEBSVolume function.
+// On success, prints a green confirmation line to stdout.
+// On failure, returns an error which the caller will log to stderr.
+func (r *Remediator) deleteEBSVolume(
+	ctx context.Context,
+	res discovery.Resource,
+	waste float64,
+) error {
+	if err := DeleteEBSVolume(ctx, r.cfg, res.ID, res.Region); err != nil {
+		return err
+	}
+
+	// Print success message in green
+	fmt.Fprintf(os.Stdout,
+		"%s[TEARDOWN]%s Successfully deleted EBS volume %s in %s\n",
+		ansiGreen,
+		ansiReset,
+		res.ID,
+		res.Region,
+	)
+
+	return nil
 }
