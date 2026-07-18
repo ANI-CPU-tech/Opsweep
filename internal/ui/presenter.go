@@ -10,6 +10,7 @@ package ui
 import (
 	"fmt"
 	"io"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/anirudh/opssweep/internal/discovery"
@@ -17,79 +18,118 @@ import (
 	"github.com/anirudh/opssweep/internal/pricing"
 )
 
-// ANSI escape codes for the banner.
+// ANSI escape codes for styled output.
 const (
-	ansiBold  = "\033[1m"
-	ansiCyan  = "\033[36m"
-	ansiDim   = "\033[2m"
-	ansiReset = "\033[0m"
+	ansiBold   = "\033[1m"
+	ansiCyan   = "\033[36m"
+	ansiAmber  = "\033[38;5;215m"
+	ansiDim    = "\033[2m"
+	ansiReset  = "\033[0m"
+	ansiOrange = "\033[38;5;208m"
 )
 
-// PrintBanner prints the OpsSweep ASCII art banner to stdout.
-// It is called once at process startup, before any AWS or Cobra logic runs,
-// so the logo is always the first thing a user sees regardless of which
-// subcommand they invoke.
+// PrintBanner prints a Claude-Code-inspired two-column welcome box to stdout.
+//
+// The box is exactly 80 visible characters wide:
+//
+//	│ (1) + left cell (38) + │ (1) + right cell (39) + │ (1) = 80
+//
+// The key design rule that makes alignment work perfectly:
+//
+//	NEVER pass a string containing ANSI escape codes to fmt.Sprintf with a
+//	width verb (%-38s), because ANSI codes add invisible bytes that Sprintf
+//	counts as visible width, which shifts everything to the right.
+//
+// Instead we use fmt.Sprintf("%-38s", plainText) to get correct padding, then
+// wrap color codes around the result AFTER padding is done.
 func PrintBanner() {
-	// Block-letter ASCII art for "OpsSweep" generated in a clean, modern
-	// style. Each line is a raw string — no escape sequences inside the art
-	// itself so the font is easy to edit without accidental color breaks.
-	const art = `
-  ██████╗ ██████╗ ███████╗███████╗██╗    ██╗███████╗███████╗██████╗
- ██╔═══██╗██╔══██╗██╔════╝██╔════╝██║    ██║██╔════╝██╔════╝██╔══██╗
- ██║   ██║██████╔╝███████╗███████╗██║ █╗ ██║█████╗  █████╗  ██████╔╝
- ██║   ██║██╔═══╝ ╚════██║╚════██║██║███╗██║██╔══╝  ██╔══╝  ██╔═══╝
- ╚██████╔╝██║     ███████║███████║╚███╔███╔╝███████╗███████╗██║
-  ╚═════╝ ╚═╝     ╚══════╝╚══════╝ ╚══╝╚══╝ ╚══════╝╚══════╝╚═╝
-`
-	// Print the art in bold cyan, then the subtitle in a dimmed style so it
-	// recedes visually behind the logo without disappearing entirely.
-	fmt.Print(ansiBold + ansiCyan + art + ansiReset)
-	fmt.Println(ansiDim + "              AWS FinOps & Remediation Engine" + ansiReset)
+	const (
+		lw = 38 // left cell visible width  (between left │ and mid │)
+		rw = 39 // right cell visible width (between mid │ and right │)
+	)
+
+	bdr := ansiAmber // short alias for the border color
+	rst := ansiReset
+
+	// cell pads plain text to exactly `width` visible chars using fmt.Sprintf,
+	// then optionally wraps the non-space portion in an ANSI color code.
+	// This is the only safe way to colorize text inside a fixed-width box cell.
+	cell := func(width int, text, colorCode string) string {
+		// Step 1: pad the plain text to the exact visible width.
+		padded := fmt.Sprintf("%-*s", width, text)
+		if colorCode == "" {
+			return padded
+		}
+		// Step 2: inject color around the text only, not the trailing spaces.
+		// This preserves the exact byte count that the terminal will display.
+		trimmed := strings.TrimRight(padded, " ")
+		trailingSpaces := padded[len(trimmed):]
+		return colorCode + trimmed + rst + trailingSpaces
+	}
+
+	// row prints one complete content line of the box.
+	row := func(leftText, leftColor, rightText, rightColor string) {
+		fmt.Printf("%s|%s%s%s|%s%s%s|%s\n",
+			bdr, rst,
+			cell(lw, leftText, leftColor),
+			bdr, rst,
+			cell(rw, rightText, rightColor),
+			bdr, rst,
+		)
+	}
+
+	// ── Top border ────────────────────────────────────────────────────────────
+	// Total inner width = lw + 1 (mid border) + rw = 78.
+	// Title " OpsSweep v1.0.0 " = 18 chars. Remaining dashes = 78 - 18 = 60.
+	fmt.Printf("%s+- OpsSweep v1.0.0 %s+%s\n",
+		bdr,
+		strings.Repeat("-", 60),
+		rst,
+	)
+
+	// ── Content rows ─────────────────────────────────────────────────────────
+
+	row("", "", "", "")
+	row(" Welcome back Anirudh!", ansiBold, "", "")
+	row("", "", "", "")
+
+	// Logo (pure ASCII robot face) paired with tips on the right
+	row("   +-------+", ansiCyan, " Tips for getting started", ansiOrange+ansiBold)
+	row("   | (o)(o)|", ansiCyan, " /scan   find idle resources", "")
+	row("   |   ==  |", ansiCyan, " /report  HTML cost report", "")
+	row("   +-------+", ansiCyan, " /help   list all commands", "")
+
+	row("", "", "", "")
+	row(" AWS FinOps & Remediation", "", " Recent activity", ansiOrange+ansiBold)
+	row(" Engine  v1.0.0", ansiDim, " No recent activity", ansiDim)
+	row("", "", "", "")
+
+	// ── Bottom border ─────────────────────────────────────────────────────────
+	fmt.Printf("%s+%s+%s\n",
+		bdr,
+		strings.Repeat("-", 78),
+		rst,
+	)
 	fmt.Println()
 }
 
 const (
 	// idleConfidenceThreshold is the minimum heuristics confidence score for a
-	// resource to appear in the waste report. Resources below this threshold are
-	// considered "probably active" and are silently omitted.
-	// 0.5 means "more likely idle than not" — deliberately permissive at the
-	// reporting stage so users see borderline cases. The teardown stage applies
-	// a stricter threshold before any destructive action.
+	// resource to appear in the waste report.
 	idleConfidenceThreshold = 0.5
 
-	// separatorWidth is the character width of the dashed line printed between
-	// the resource rows and the totals footer. Wide enough to span all columns
-	// at typical terminal widths.
+	// separatorWidth is the character width of the dashed separator line.
 	separatorWidth = 72
 )
 
 // PrintWasteReport writes a tab-aligned terminal table of idle resources and
 // their estimated monthly cost to out.
-//
-// For each resource in the slice, it:
-//  1. Runs [heuristics.Evaluate] to compute an idle confidence score.
-//  2. Skips the resource if it is protected (ShouldSkip=true) or if its
-//     confidence is below [idleConfidenceThreshold].
-//  3. Calls [pricing.CalculateMonthlyWaste] to get the monthly cost estimate.
-//  4. Prints one tab-separated row per qualifying resource.
-//
-// After the resource rows it prints a separator and a TOTAL POTENTIAL SAVINGS
-// line. If no resources meet the threshold the function prints a short "nothing
-// found" message instead of an empty table.
-//
-// The function flushes the underlying tabwriter before returning so the caller
-// does not need to do anything after the call completes.
 func PrintWasteReport(out io.Writer, resources []discovery.Resource) error {
-	// Use the default heuristics config (IdleThreshold=0.6, time.Now() for age).
-	// The presenter applies its own looser threshold (0.5) at display time so
-	// borderline resources are visible in the report even if the engine would
-	// not flag them for teardown.
 	cfg := heuristics.DefaultConfig()
 
-	// ── Evaluate and filter ───────────────────────────────────────────────────
 	type row struct {
-		res        discovery.Resource
-		score      heuristics.Score
+		res         discovery.Resource
+		score       heuristics.Score
 		monthlyCost float64
 	}
 
@@ -100,42 +140,28 @@ func PrintWasteReport(out io.Writer, resources []discovery.Resource) error {
 
 	for _, res := range resources {
 		score := heuristics.Evaluate(res, cfg)
-
-		// Hard skip: protected tag (keep=true, env=prod). Never show these.
 		if score.ShouldSkip {
 			continue
 		}
-
-		// Soft skip: not idle enough to report.
 		if score.Confidence < idleConfidenceThreshold {
 			continue
 		}
-
 		cost := pricing.CalculateMonthlyWaste(res, true)
 		totalSavings += cost
-
 		rows = append(rows, row{res: res, score: score, monthlyCost: cost})
 	}
 
-	// ── Empty state ───────────────────────────────────────────────────────────
 	if len(rows) == 0 {
 		_, err := fmt.Fprintln(out, "No idle resources found. Your account looks clean!")
 		return err
 	}
 
-	// ── Build the tabwriter ───────────────────────────────────────────────────
-	// tabwriter.NewWriter pads each column to align tabs across all rows.
-	// MinWidth=0, TabWidth=0 let the content drive column widths.
-	// Padding=2 adds two spaces between columns for visual breathing room.
-	// AlignRight=false (flag 0) left-aligns all columns.
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 
-	// ── Header ────────────────────────────────────────────────────────────────
 	if _, err := fmt.Fprintln(tw, "RESOURCE ID\tTYPE\tREGION\tSTATE\tCONFIDENCE\tMONTHLY WASTE"); err != nil {
 		return fmt.Errorf("ui: writing header: %w", err)
 	}
 
-	// ── Resource rows ─────────────────────────────────────────────────────────
 	for _, r := range rows {
 		line := fmt.Sprintf(
 			"%s\t%s\t%s\t%s\t%.0f%%\t$%.2f",
@@ -143,7 +169,7 @@ func PrintWasteReport(out io.Writer, resources []discovery.Resource) error {
 			r.res.Type,
 			r.res.Region,
 			r.res.State,
-			r.score.Confidence*100, // display as percentage, e.g. "90%"
+			r.score.Confidence*100,
 			r.monthlyCost,
 		)
 		if _, err := fmt.Fprintln(tw, line); err != nil {
@@ -151,14 +177,11 @@ func PrintWasteReport(out io.Writer, resources []discovery.Resource) error {
 		}
 	}
 
-	// Flush here so the separator is printed after the aligned table, not
-	// interleaved with unflushed tab-padded content.
 	if err := tw.Flush(); err != nil {
 		return fmt.Errorf("ui: flushing table: %w", err)
 	}
 
-	// ── Footer ────────────────────────────────────────────────────────────────
-	separator := repeatChar('-', separatorWidth)
+	separator := strings.Repeat("-", separatorWidth)
 	if _, err := fmt.Fprintln(out, separator); err != nil {
 		return fmt.Errorf("ui: writing separator: %w", err)
 	}
@@ -171,7 +194,6 @@ func PrintWasteReport(out io.Writer, resources []discovery.Resource) error {
 }
 
 // repeatChar returns a string of n copies of ch.
-// Used to build the separator line without importing strings or bytes.
 func repeatChar(ch byte, n int) string {
 	b := make([]byte, n)
 	for i := range b {

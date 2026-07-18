@@ -16,12 +16,14 @@ package cli
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 
+	"github.com/anirudh/opssweep/internal/discovery"
 	"github.com/anirudh/opssweep/internal/ui"
 )
 
@@ -38,9 +40,10 @@ const (
 
 // Start launches the interactive OpsSweep shell (REPL).
 //
-// The shell prints the branded banner once on startup, then enters an infinite
-// loop reading commands from stdin. The AWS config is passed in once at session
-// start and reused across all commands — no re-authentication required.
+// The shell prints the premium bordered banner once on startup, then enters
+// an infinite loop reading commands from stdin. The AWS config and context are
+// passed in once at session start and reused across all commands — no
+// re-authentication required.
 //
 // # Command structure
 //
@@ -51,29 +54,25 @@ const (
 // # Exit conditions
 //
 // The loop runs until:
-//   - The user types /exit or /quit
+//   - The user types /exit or quit
 //   - stdin closes (EOF, e.g. piped input exhausted or Ctrl+D in terminal)
 //   - An unrecoverable error occurs (e.g. scanner.Scan() fails after retries)
 //
 // Normal command errors (e.g. AWS API throttling, invalid region) are caught,
 // logged, and do NOT terminate the session — the user stays in the shell and
 // can retry or try a different command.
-func Start(cfg aws.Config) {
+func Start(ctx context.Context, cfg aws.Config) {
 	// ── Banner ────────────────────────────────────────────────────────────────
-	// Print once at session start, not on every command invocation.
+	// Print the premium bordered banner once at session start.
 	ui.PrintBanner()
-
-	// Welcome message — dimmed to recede behind the logo but still visible.
-	fmt.Println(ansiDim + "Welcome to the interactive shell. Type /help for available commands." + ansiReset)
-	fmt.Println()
 
 	// ── Input loop ────────────────────────────────────────────────────────────
 	scanner := bufio.NewScanner(os.Stdin)
 
 	for {
-		// Print the styled prompt on the same line as user input.
-		// Cyan makes the prompt visually distinct from command output above it.
-		fmt.Print(ansiCyan + "opsweep> " + ansiReset)
+		// Print the minimal prompt: just "> " with no color or prefix.
+		// Clean and unobtrusive, letting command output be the star.
+		fmt.Print(ansiDim + "> " + ansiReset)
 
 		// Read the next line from stdin.
 		// scanner.Scan() returns false on EOF (Ctrl+D) or a read error.
@@ -92,29 +91,30 @@ func Start(cfg aws.Config) {
 		// ── Command dispatch ──────────────────────────────────────────────────
 		switch input {
 
-		case "/exit", "/quit":
-			fmt.Println(ansiGreen + "Goodbye! 👋" + ansiReset)
+		case "/exit", "quit":
+			// Clean exit message in green, then return to terminate the loop.
+			fmt.Println(ansiGreen + "✓ " + ansiReset + "Goodbye! Session ended.")
 			return
 
 		case "/clear":
 			// ANSI escape sequence: \033[H moves cursor to home (top-left),
 			// \033[2J clears the entire screen buffer.
 			fmt.Print("\033[H\033[2J")
+			// Reprint the banner so the user sees it again after clearing.
+			ui.PrintBanner()
 
 		case "/help":
 			printHelp()
 
 		case "/scan":
-			// TODO: wire the discovery scanner back up in the next step.
-			// For now, print a system message so the user knows the command
-			// is recognized even though it doesn't do anything yet.
-			fmt.Println(ansiYellow + "[SYSTEM]" + ansiReset + " Initiating AWS environment scan...")
+			runScan(ctx, cfg)
 
 		default:
-			// Unrecognized command — print a helpful error without killing
-			// the session. Red text makes it clear this is an error.
-			fmt.Println(ansiRed + "✗ Unknown command:" + ansiReset + " " + input)
-			fmt.Println(ansiDim + "  Type /help to see available commands." + ansiReset)
+			// Unrecognized command — print a subtle error without killing
+			// the session. Dimmed text keeps it low-key.
+			if input != "" {
+				fmt.Println(ansiDim + "Unknown command. Type /help" + ansiReset)
+			}
 		}
 
 		// Add a blank line after command output so the next prompt is visually
@@ -130,25 +130,85 @@ func Start(cfg aws.Config) {
 	}
 }
 
-// printHelp writes a nicely formatted, color-coded list of available commands
-// to stdout. Called when the user types /help.
+// printHelp writes a formatted, two-column list of available commands to stdout.
+// Called when the user types /help.
 //
-// The format is designed for scannability: command names in bold cyan, short
-// descriptions in normal weight, grouped by category (navigation, operations).
+// The format is designed for scannability: command names in cyan, short
+// descriptions aligned in a second column.
 func printHelp() {
 	fmt.Println(ansiBold + "Available Commands:" + ansiReset)
 	fmt.Println()
 
-	// ── Navigation ────────────────────────────────────────────────────────────
-	fmt.Println(ansiDim + "Navigation:" + ansiReset)
-	fmt.Printf("  %s/help%s      Show this help message\n", ansiCyan, ansiReset)
-	fmt.Printf("  %s/clear%s     Clear the terminal screen\n", ansiCyan, ansiReset)
-	fmt.Printf("  %s/exit%s      Exit the interactive shell\n", ansiCyan, ansiReset)
+	// Two-column format: command name (cyan, left-padded) and description.
+	commands := []struct {
+		name string
+		desc string
+	}{
+		{"/scan", "Scan AWS regions for idle resources"},
+		{"/report", "Generate an HTML FinOps audit report"},
+		{"/clear", "Clear the terminal screen"},
+		{"/help", "Show this help message"},
+		{"/exit", "Exit the interactive shell"},
+	}
+
+	for _, cmd := range commands {
+		fmt.Printf("  %s%-12s%s  %s\n", ansiCyan, cmd.name, ansiReset, cmd.desc)
+	}
+}
+
+// runScan executes the full multi-region discovery pipeline and prints the
+// waste report to stdout. It is intentionally a standalone function (not a
+// method) so it can be called cleanly from the switch without cluttering Start.
+//
+// Execution order:
+//  1. Print a loading message so the user knows something is happening —
+//     the scan can take several seconds as it fans out across all regions.
+//  2. Initialise the AWS scanner with the session-level config.
+//  3. Run RunConcurrentScan, which fans out one goroutine per region and
+//     collects all discovered resources into a flat slice.
+//  4. Hand the slice to ui.PrintWasteReport, which scores every resource
+//     through the heuristics engine, filters below the confidence threshold,
+//     calculates monthly waste via the pricing package, and renders the table.
+//
+// Errors are printed to stderr but do NOT terminate the shell — the user stays
+// in the REPL and can retry or try a different command.
+func runScan(ctx context.Context, cfg aws.Config) {
+	// ── 1. Loading message ────────────────────────────────────────────────────
+	fmt.Println(ansiCyan + "[SYSTEM] Scanning AWS regions for idle resources. This may take a moment..." + ansiReset)
 	fmt.Println()
 
-	// ── Operations ────────────────────────────────────────────────────────────
-	fmt.Println(ansiDim + "Operations:" + ansiReset)
-	fmt.Printf("  %s/scan%s      Scan AWS regions for idle resources\n", ansiCyan, ansiReset)
-	fmt.Printf("  %s/report%s    Generate an HTML FinOps audit report\n", ansiCyan, ansiReset)
-	fmt.Printf("  %s/teardown%s  Safely delete flagged resources\n", ansiCyan, ansiReset)
+	// ── 2. Initialise scanner ─────────────────────────────────────────────────
+	// NewAWSScanner holds only the base config; regional EC2/RDS/CloudWatch
+	// clients are constructed on demand per-region inside the scanner.
+	scanner := discovery.NewAWSScanner(cfg)
+
+	// ── 3. Run the concurrent scan ────────────────────────────────────────────
+	// RunConcurrentScan fans out across all enabled regions, collects results,
+	// and returns a merged []discovery.Resource slice. The call blocks until
+	// all goroutines complete or the context is cancelled (e.g. Ctrl+C).
+	resources, err := discovery.RunConcurrentScan(ctx, scanner)
+	if err != nil {
+		// Context cancellation (Ctrl+C mid-scan) is surfaced here. Print a
+		// user-friendly message rather than a raw Go error.
+		if ctx.Err() != nil {
+			fmt.Fprintf(os.Stderr,
+				ansiRed+"[ERROR]"+ansiReset+" Scan cancelled.\n",
+			)
+		} else {
+			fmt.Fprintf(os.Stderr,
+				ansiRed+"[ERROR]"+ansiReset+" Scan failed: %v\n", err,
+			)
+		}
+		return
+	}
+
+	// ── 4. Print the waste report ─────────────────────────────────────────────
+	// PrintWasteReport handles scoring (heuristics), pricing, and table
+	// rendering internally. We pass os.Stdout directly so the output streams
+	// to the terminal immediately — no buffering required at this level.
+	if err := ui.PrintWasteReport(os.Stdout, resources); err != nil {
+		fmt.Fprintf(os.Stderr,
+			ansiRed+"[ERROR]"+ansiReset+" Failed to render report: %v\n", err,
+		)
+	}
 }
