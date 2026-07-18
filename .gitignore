@@ -59,3 +59,4 @@ docker-compose.override.yml
 # ─── Misc ─────────────────────────────────────────────────────────────────────
 tmp/
 *.log
+opsweep
