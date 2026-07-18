@@ -17,6 +17,37 @@ import (
 	"github.com/anirudh/opssweep/internal/pricing"
 )
 
+// ANSI escape codes for the banner.
+const (
+	ansiBold  = "\033[1m"
+	ansiCyan  = "\033[36m"
+	ansiDim   = "\033[2m"
+	ansiReset = "\033[0m"
+)
+
+// PrintBanner prints the OpsSweep ASCII art banner to stdout.
+// It is called once at process startup, before any AWS or Cobra logic runs,
+// so the logo is always the first thing a user sees regardless of which
+// subcommand they invoke.
+func PrintBanner() {
+	// Block-letter ASCII art for "OpsSweep" generated in a clean, modern
+	// style. Each line is a raw string — no escape sequences inside the art
+	// itself so the font is easy to edit without accidental color breaks.
+	const art = `
+  ██████╗ ██████╗ ███████╗███████╗██╗    ██╗███████╗███████╗██████╗
+ ██╔═══██╗██╔══██╗██╔════╝██╔════╝██║    ██║██╔════╝██╔════╝██╔══██╗
+ ██║   ██║██████╔╝███████╗███████╗██║ █╗ ██║█████╗  █████╗  ██████╔╝
+ ██║   ██║██╔═══╝ ╚════██║╚════██║██║███╗██║██╔══╝  ██╔══╝  ██╔═══╝
+ ╚██████╔╝██║     ███████║███████║╚███╔███╔╝███████╗███████╗██║
+  ╚═════╝ ╚═╝     ╚══════╝╚══════╝ ╚══╝╚══╝ ╚══════╝╚══════╝╚═╝
+`
+	// Print the art in bold cyan, then the subtitle in a dimmed style so it
+	// recedes visually behind the logo without disappearing entirely.
+	fmt.Print(ansiBold + ansiCyan + art + ansiReset)
+	fmt.Println(ansiDim + "              AWS FinOps & Remediation Engine" + ansiReset)
+	fmt.Println()
+}
+
 const (
 	// idleConfidenceThreshold is the minimum heuristics confidence score for a
 	// resource to appear in the waste report. Resources below this threshold are
