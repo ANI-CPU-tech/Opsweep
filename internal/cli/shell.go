@@ -24,6 +24,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 
 	"github.com/anirudh/opssweep/internal/discovery"
+	"github.com/anirudh/opssweep/internal/remediation"
+	"github.com/anirudh/opssweep/internal/report"
 	"github.com/anirudh/opssweep/internal/ui"
 )
 
@@ -45,170 +47,198 @@ const (
 // passed in once at session start and reused across all commands — no
 // re-authentication required.
 //
-// # Command structure
+// # Input parsing
 //
-// Commands are slash-prefixed (e.g. /scan, /report, /teardown) to distinguish
-// them from free-form input. This leaves room for future natural-language
-// features ("show me idle resources in us-east-1") without ambiguity.
+// Each line of input is split into tokens via strings.Fields. The first token
+// is the command (e.g. "/scan"); remaining tokens are treated as arguments
+// (e.g. "--teardown", "--output=report.html"). This mirrors how real shells
+// tokenise input without requiring a full flag parser.
 //
 // # Exit conditions
 //
 // The loop runs until:
 //   - The user types /exit or quit
 //   - stdin closes (EOF, e.g. piped input exhausted or Ctrl+D in terminal)
-//   - An unrecoverable error occurs (e.g. scanner.Scan() fails after retries)
+//   - An unrecoverable read error occurs
 //
-// Normal command errors (e.g. AWS API throttling, invalid region) are caught,
-// logged, and do NOT terminate the session — the user stays in the shell and
-// can retry or try a different command.
+// Normal command errors (AWS API failures, file write errors) are caught,
+// logged to stderr, and do NOT terminate the session.
 func Start(ctx context.Context, cfg aws.Config) {
-	// ── Banner ────────────────────────────────────────────────────────────────
 	// Print the premium bordered banner once at session start.
 	ui.PrintBanner()
 
-	// ── Input loop ────────────────────────────────────────────────────────────
-	scanner := bufio.NewScanner(os.Stdin)
+	lineScanner := bufio.NewScanner(os.Stdin)
 
 	for {
-		// Print the minimal prompt: just "> " with no color or prefix.
-		// Clean and unobtrusive, letting command output be the star.
 		fmt.Print(ansiDim + "> " + ansiReset)
 
-		// Read the next line from stdin.
-		// scanner.Scan() returns false on EOF (Ctrl+D) or a read error.
-		if !scanner.Scan() {
+		if !lineScanner.Scan() {
 			break
 		}
 
-		// Trim leading/trailing whitespace so "  /help  " is treated as "/help".
-		input := strings.TrimSpace(scanner.Text())
+		// Split into tokens. strings.Fields handles multiple spaces and tabs,
+		// and returns an empty slice for blank lines — no panic risk.
+		args := strings.Fields(lineScanner.Text())
 
-		// Skip empty lines — pressing Enter with no input is a no-op.
-		if input == "" {
+		// Empty line: re-show the prompt without any output.
+		if len(args) == 0 {
 			continue
 		}
 
+		command := args[0]  // e.g. "/scan"
+		flags := args[1:]   // e.g. ["--teardown"] or []
+
 		// ── Command dispatch ──────────────────────────────────────────────────
-		switch input {
+		switch command {
 
 		case "/exit", "quit":
-			// Clean exit message in green, then return to terminate the loop.
 			fmt.Println(ansiGreen + "✓ " + ansiReset + "Goodbye! Session ended.")
 			return
 
 		case "/clear":
-			// ANSI escape sequence: \033[H moves cursor to home (top-left),
-			// \033[2J clears the entire screen buffer.
 			fmt.Print("\033[H\033[2J")
-			// Reprint the banner so the user sees it again after clearing.
 			ui.PrintBanner()
 
 		case "/help":
 			printHelp()
 
 		case "/scan":
-			runScan(ctx, cfg)
+			runScan(ctx, cfg, flags)
+
+		case "/report":
+			runReport(ctx, cfg, flags)
 
 		default:
-			// Unrecognized command — print a subtle error without killing
-			// the session. Dimmed text keeps it low-key.
-			if input != "" {
-				fmt.Println(ansiDim + "Unknown command. Type /help" + ansiReset)
-			}
+			fmt.Println(ansiDim + "Unknown command. Type /help" + ansiReset)
 		}
 
-		// Add a blank line after command output so the next prompt is visually
-		// separated. This prevents the output from running together into an
-		// unreadable wall of text.
 		fmt.Println()
 	}
 
-	// ── Post-loop cleanup ─────────────────────────────────────────────────────
-	// If we exit the loop due to scanner.Err() rather than EOF, log it.
-	if err := scanner.Err(); err != nil {
+	if err := lineScanner.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, ansiRed+"[ERROR]"+ansiReset+" Failed to read input: %v\n", err)
 	}
 }
 
-// printHelp writes a formatted, two-column list of available commands to stdout.
-// Called when the user types /help.
+// hasFlag reports whether a specific flag string is present in the args slice.
+// A linear scan is fine — the number of flags is always tiny.
+func hasFlag(args []string, flag string) bool {
+	for _, a := range args {
+		if a == flag {
+			return true
+		}
+	}
+	return false
+}
+
+// scanResources runs the multi-region discovery pipeline and returns the raw
+// resource slice. It is shared by runScan and runReport to avoid duplicating
+// the scanner initialisation and error handling.
 //
-// The format is designed for scannability: command names in cyan, short
-// descriptions aligned in a second column.
+// Returns nil on any error; the error has already been written to stderr.
+func scanResources(ctx context.Context, cfg aws.Config) []discovery.Resource {
+	fmt.Println(ansiCyan + "[SYSTEM] Scanning AWS regions for idle resources. This may take a moment..." + ansiReset)
+	fmt.Println()
+
+	s := discovery.NewAWSScanner(cfg)
+	resources, err := discovery.RunConcurrentScan(ctx, s)
+	if err != nil {
+		if ctx.Err() != nil {
+			fmt.Fprintf(os.Stderr, ansiRed+"[ERROR]"+ansiReset+" Scan cancelled.\n")
+		} else {
+			fmt.Fprintf(os.Stderr, ansiRed+"[ERROR]"+ansiReset+" Scan failed: %v\n", err)
+		}
+		return nil
+	}
+	return resources
+}
+
+// runScan executes a full discovery scan and either:
+//   - (default) prints the waste report table to stdout, or
+//   - (--teardown) prints the report AND runs live deletion via the Remediator.
+//
+// The Remediator.Process call receives the full resource slice and handles its
+// own confidence filtering internally (threshold: 0.90). There is no need to
+// loop and call it per-resource — that would bypass its own queuing logic.
+func runScan(ctx context.Context, cfg aws.Config, flags []string) {
+	resources := scanResources(ctx, cfg)
+	if resources == nil {
+		return // error already printed
+	}
+
+	// Always print the waste table so the user can see what was found.
+	if err := ui.PrintWasteReport(os.Stdout, resources); err != nil {
+		fmt.Fprintf(os.Stderr, ansiRed+"[ERROR]"+ansiReset+" Failed to render report: %v\n", err)
+		return
+	}
+
+	// ── Teardown pass (opt-in) ────────────────────────────────────────────────
+	if !hasFlag(flags, "--teardown") {
+		return
+	}
+
+	// Live teardown: warn loudly before making any mutating AWS API calls.
+	fmt.Println()
+	fmt.Println(ansiRed + "[WARNING] Executing live teardown. Resources will be permanently deleted." + ansiReset)
+	fmt.Println()
+
+	// Process accepts the full slice and applies the 0.90 confidence threshold
+	// internally. isDryRun=false triggers real AWS deletion API calls.
+	remediator := remediation.NewRemediator(cfg)
+	if err := remediator.Process(ctx, resources, false); err != nil {
+		fmt.Fprintf(os.Stderr, ansiRed+"[ERROR]"+ansiReset+" Teardown failed: %v\n", err)
+	}
+}
+
+// runReport executes a full discovery scan and writes a self-contained HTML
+// FinOps audit report to disk. The output path defaults to "audit.html" but
+// can be overridden with --output=<path>.
+//
+// Example:
+//
+//	/report
+//	/report --output=reports/2024-q1.html
+func runReport(ctx context.Context, cfg aws.Config, flags []string) {
+	resources := scanResources(ctx, cfg)
+	if resources == nil {
+		return // error already printed
+	}
+
+	// Determine output path: default to "audit.html", allow override.
+	outputPath := "audit.html"
+	for _, f := range flags {
+		if strings.HasPrefix(f, "--output=") {
+			outputPath = strings.TrimPrefix(f, "--output=")
+		}
+	}
+
+	if err := report.GenerateHTMLReport(resources, outputPath); err != nil {
+		fmt.Fprintf(os.Stderr, ansiRed+"[ERROR]"+ansiReset+" Failed to generate report: %v\n", err)
+		return
+	}
+
+	fmt.Println(ansiGreen + "[REPORT] Successfully generated FinOps audit at " + outputPath + ansiReset)
+}
+
+// printHelp writes a formatted, two-column list of available commands to stdout.
 func printHelp() {
 	fmt.Println(ansiBold + "Available Commands:" + ansiReset)
 	fmt.Println()
 
-	// Two-column format: command name (cyan, left-padded) and description.
 	commands := []struct {
-		name string
-		desc string
+		usage string
+		desc  string
 	}{
-		{"/scan", "Scan AWS regions for idle resources"},
-		{"/report", "Generate an HTML FinOps audit report"},
+		{"/scan", "Scan all AWS regions for idle resources"},
+		{"/scan --teardown", "Scan and live-delete high-confidence waste"},
+		{"/report", "Scan and write HTML audit to audit.html"},
+		{"/report --output=<path>", "Write HTML audit to a custom path"},
 		{"/clear", "Clear the terminal screen"},
 		{"/help", "Show this help message"},
 		{"/exit", "Exit the interactive shell"},
 	}
 
 	for _, cmd := range commands {
-		fmt.Printf("  %s%-12s%s  %s\n", ansiCyan, cmd.name, ansiReset, cmd.desc)
-	}
-}
-
-// runScan executes the full multi-region discovery pipeline and prints the
-// waste report to stdout. It is intentionally a standalone function (not a
-// method) so it can be called cleanly from the switch without cluttering Start.
-//
-// Execution order:
-//  1. Print a loading message so the user knows something is happening —
-//     the scan can take several seconds as it fans out across all regions.
-//  2. Initialise the AWS scanner with the session-level config.
-//  3. Run RunConcurrentScan, which fans out one goroutine per region and
-//     collects all discovered resources into a flat slice.
-//  4. Hand the slice to ui.PrintWasteReport, which scores every resource
-//     through the heuristics engine, filters below the confidence threshold,
-//     calculates monthly waste via the pricing package, and renders the table.
-//
-// Errors are printed to stderr but do NOT terminate the shell — the user stays
-// in the REPL and can retry or try a different command.
-func runScan(ctx context.Context, cfg aws.Config) {
-	// ── 1. Loading message ────────────────────────────────────────────────────
-	fmt.Println(ansiCyan + "[SYSTEM] Scanning AWS regions for idle resources. This may take a moment..." + ansiReset)
-	fmt.Println()
-
-	// ── 2. Initialise scanner ─────────────────────────────────────────────────
-	// NewAWSScanner holds only the base config; regional EC2/RDS/CloudWatch
-	// clients are constructed on demand per-region inside the scanner.
-	scanner := discovery.NewAWSScanner(cfg)
-
-	// ── 3. Run the concurrent scan ────────────────────────────────────────────
-	// RunConcurrentScan fans out across all enabled regions, collects results,
-	// and returns a merged []discovery.Resource slice. The call blocks until
-	// all goroutines complete or the context is cancelled (e.g. Ctrl+C).
-	resources, err := discovery.RunConcurrentScan(ctx, scanner)
-	if err != nil {
-		// Context cancellation (Ctrl+C mid-scan) is surfaced here. Print a
-		// user-friendly message rather than a raw Go error.
-		if ctx.Err() != nil {
-			fmt.Fprintf(os.Stderr,
-				ansiRed+"[ERROR]"+ansiReset+" Scan cancelled.\n",
-			)
-		} else {
-			fmt.Fprintf(os.Stderr,
-				ansiRed+"[ERROR]"+ansiReset+" Scan failed: %v\n", err,
-			)
-		}
-		return
-	}
-
-	// ── 4. Print the waste report ─────────────────────────────────────────────
-	// PrintWasteReport handles scoring (heuristics), pricing, and table
-	// rendering internally. We pass os.Stdout directly so the output streams
-	// to the terminal immediately — no buffering required at this level.
-	if err := ui.PrintWasteReport(os.Stdout, resources); err != nil {
-		fmt.Fprintf(os.Stderr,
-			ansiRed+"[ERROR]"+ansiReset+" Failed to render report: %v\n", err,
-		)
+		fmt.Printf("  %s%-28s%s  %s\n", ansiCyan, cmd.usage, ansiReset, cmd.desc)
 	}
 }
