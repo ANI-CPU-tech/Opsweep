@@ -10,8 +10,11 @@ package ui
 import (
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"text/tabwriter"
+
+	"golang.org/x/term"
 
 	"github.com/anirudh/opssweep/internal/discovery"
 	"github.com/anirudh/opssweep/internal/heuristics"
@@ -28,88 +31,162 @@ const (
 	ansiOrange = "\033[38;5;208m"
 )
 
-// PrintBanner prints a Claude-Code-inspired two-column welcome box to stdout.
+// Box-drawing characters for the banner's rounded border. Each one is a
+// single Unicode rune that occupies exactly one terminal column, so they
+// drop straight into the same width arithmetic as the plain-ASCII
+// "+"/"-"/"|" they replace — the "ANSI-safety rule" below covers why that's
+// safe (fmt pads by rune count, and these glyphs are single-width, so
+// nothing here needs special-casing).
+const (
+	boxTopLeft     = "╭"
+	boxTopRight    = "╮"
+	boxBottomLeft  = "╰"
+	boxBottomRight = "╯"
+	boxHorizontal  = "─"
+	boxVertical    = "│"
+)
+
+// PrintBanner prints a dynamically-sized two-column welcome box that exactly
+// fills the current terminal width. The layout is modeled on the Claude Code
+// CLI banner: a rounded border, a welcome line paired with a "Tips for
+// getting started" header, a short command list, a divider, and a "Recent
+// activity" section, with product/version info tucked into the bottom-left
+// corner.
 //
-// The box is exactly 80 visible characters wide:
+// # Layout arithmetic
 //
-//	│ (1) + left cell (38) + │ (1) + right cell (39) + │ (1) = 80
+// The format string for every content row is:
 //
-// The key design rule that makes alignment work perfectly:
+//	border | space | %-38s | space | border | space | %-*s | space | border
+//	 ^               ^                        ^
+//	 |               left cell (38 visible chars)     right cell (rightInner chars)
+//	 left border + space (1 + 1)
 //
-//	NEVER pass a string containing ANSI escape codes to fmt.Sprintf with a
-//	width verb (%-38s), because ANSI codes add invisible bytes that Sprintf
-//	counts as visible width, which shifts everything to the right.
+// Counting visible chars: 1 + 1 + 38 + 1 + 1 + 1 + rightInner + 1 + 1 = 45 + rightInner
+// Setting that equal to `width`:  rightInner = width - 45
 //
-// Instead we use fmt.Sprintf("%-38s", plainText) to get correct padding, then
-// wrap color codes around the result AFTER padding is done.
+// # ANSI-safety rule
+//
+// NEVER pass a string that contains ANSI escape codes to fmt.Sprintf with a
+// width verb (%-38s or %-*s). fmt pads strings by rune count, and while a
+// single ANSI escape sequence like "\033[1m" is invisible on screen, it is
+// still several runes ('\033', '[', '1', 'm'), so it would inflate the
+// measured width and push the right border out of alignment.
+//
+// The safe pattern used throughout this function:
+//  1. Pad the plain text with fmt.Sprintf("%-*s", width, plainText).
+//  2. THEN wrap the non-space portion in ANSI codes.
+//  3. Trailing spaces are kept plain so the terminal cell count stays correct.
 func PrintBanner() {
-	const (
-		lw = 38 // left cell visible width  (between left │ and mid │)
-		rw = 39 // right cell visible width (between mid │ and right │)
-	)
-
-	bdr := ansiAmber // short alias for the border color
-	rst := ansiReset
-
-	// cell pads plain text to exactly `width` visible chars using fmt.Sprintf,
-	// then optionally wraps the non-space portion in an ANSI color code.
-	// This is the only safe way to colorize text inside a fixed-width box cell.
-	cell := func(width int, text, colorCode string) string {
-		// Step 1: pad the plain text to the exact visible width.
-		padded := fmt.Sprintf("%-*s", width, text)
-		if colorCode == "" {
-			return padded
-		}
-		// Step 2: inject color around the text only, not the trailing spaces.
-		// This preserves the exact byte count that the terminal will display.
-		trimmed := strings.TrimRight(padded, " ")
-		trailingSpaces := padded[len(trimmed):]
-		return colorCode + trimmed + rst + trailingSpaces
+	// ── 1. Detect terminal width ──────────────────────────────────────────────
+	width, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || width < 60 {
+		width = 100
 	}
 
-	// row prints one complete content line of the box.
-	row := func(leftText, leftColor, rightText, rightColor string) {
-		fmt.Printf("%s|%s%s%s|%s%s%s|%s\n",
-			bdr, rst,
-			cell(lw, leftText, leftColor),
-			bdr, rst,
-			cell(rw, rightText, rightColor),
-			bdr, rst,
+	// ── 2. Column widths ──────────────────────────────────────────────────────
+	rightWidth := width - 45
+	if rightWidth < 10 {
+		rightWidth = 10
+	}
+
+	// ── 3. Row printers ────────────────────────────────────────────────────────
+	// row prints a plain (uncolored) content row. leftText/rightText are
+	// pre-padded to their exact visible widths before the border runes are
+	// added, so the border always lands in the same column regardless of
+	// content length.
+	row := func(leftText, rightText string) {
+		leftCol := fmt.Sprintf("%-38s", leftText)
+		rightCol := fmt.Sprintf("%-*s", rightWidth, rightText)
+
+		fmt.Printf("%s%s%s %s %s%s%s %s %s%s%s\n",
+			ansiAmber, boxVertical, ansiReset,
+			leftCol,
+			ansiAmber, boxVertical, ansiReset,
+			rightCol,
+			ansiAmber, boxVertical, ansiReset,
 		)
 	}
 
-	// ── Top border ────────────────────────────────────────────────────────────
-	// Total inner width = lw + 1 (mid border) + rw = 78.
-	// Title " OpsSweep v1.0.0 " = 18 chars. Remaining dashes = 78 - 18 = 60.
-	fmt.Printf("%s+- OpsSweep v1.0.0 %s+%s\n",
-		bdr,
-		strings.Repeat("-", 60),
-		rst,
-	)
+	// colorRow is like row but wraps each cell's non-space content in an ANSI
+	// color code. Padding happens first on the plain text; color is injected
+	// around only the visible characters so trailing spaces stay plain and
+	// the cell width is unaffected.
+	colorRow := func(leftText, leftColor, rightText, rightColor string) {
+		leftPadded := fmt.Sprintf("%-38s", leftText)
+		rightPadded := fmt.Sprintf("%-*s", rightWidth, rightText)
 
-	// ── Content rows ─────────────────────────────────────────────────────────
+		applyColor := func(padded, color string) string {
+			if color == "" {
+				return padded
+			}
+			trimmed := strings.TrimRight(padded, " ")
+			if trimmed == "" {
+				return padded // nothing to color; return spaces as-is
+			}
+			return color + trimmed + ansiReset + padded[len(trimmed):]
+		}
 
-	row("", "", "", "")
-	row(" Welcome back Anirudh!", ansiBold, "", "")
-	row("", "", "", "")
+		leftColored := applyColor(leftPadded, leftColor)
+		rightColored := applyColor(rightPadded, rightColor)
 
-	// Logo (pure ASCII robot face) paired with tips on the right
-	row("   +-------+", ansiCyan, " Tips for getting started", ansiOrange+ansiBold)
-	row("   | (o)(o)|", ansiCyan, " /scan   find idle resources", "")
-	row("   |   ==  |", ansiCyan, " /report  HTML cost report", "")
-	row("   +-------+", ansiCyan, " /help   list all commands", "")
+		// Exactly 11 %s verbs, 11 string arguments — no mismatch possible.
+		fmt.Printf("%s%s%s %s %s%s%s %s %s%s%s\n",
+			ansiAmber, boxVertical, ansiReset,
+			leftColored,
+			ansiAmber, boxVertical, ansiReset,
+			rightColored,
+			ansiAmber, boxVertical, ansiReset,
+		)
+	}
 
-	row("", "", "", "")
-	row(" AWS FinOps & Remediation", "", " Recent activity", ansiOrange+ansiBold)
-	row(" Engine  v1.0.0", ansiDim, " No recent activity", ansiDim)
-	row("", "", "", "")
+	// ── 4. Top border ─────────────────────────────────────────────────────────
+	// "╭─ OpsSweep v1.0.0 ────────────────────────────────────────────────╮"
+	// Fixed chars = corner + dash + space + space + corner = 5, so:
+	//   dashes = width - 5 - len(label)
+	const label = "OpsSweep v1.0.0"
+	dashes := width - 5 - len(label)
+	if dashes < 1 {
+		dashes = 1
+	}
+	top := boxTopLeft + boxHorizontal + " " + label + " " + strings.Repeat(boxHorizontal, dashes) + boxTopRight
+	fmt.Printf("%s%s%s\n", ansiAmber, top, ansiReset)
 
-	// ── Bottom border ─────────────────────────────────────────────────────────
-	fmt.Printf("%s+%s+%s\n",
-		bdr,
-		strings.Repeat("-", 78),
-		rst,
-	)
+	// ── 5. Content rows ───────────────────────────────────────────────────────
+	row("", "")
+	colorRow(" Welcome back Anirudh!", ansiBold, " Tips for getting started", ansiOrange+ansiBold)
+	row("", " /scan    find idle resources")
+
+	// Pixel-block cloud logo, paired with the rest of the command list.
+	// Built from U+2588 FULL BLOCK — like the box-drawing runes above,
+	// it's single-width, so it's safe to pad via %-38s without throwing
+	// off the border alignment. Each row is a solid bar of a different
+	// width/offset; stacking them is what produces the stepped, blocky
+	// cloud silhouette instead of a smooth curve.
+colorRow("            ████", ansiCyan, " /report  HTML cost report", "")
+colorRow("          ████████", ansiCyan, " /help    list all commands", "")
+colorRow("        ████████████", ansiCyan, "", "")
+colorRow("      ████████████████", ansiCyan, "", "")
+colorRow("      ██████    ██████", ansiCyan, "", "")
+colorRow("      ██████    ██████", ansiCyan, "", "")
+colorRow("      ██████    ██████", ansiCyan, "", "")
+colorRow("      ████████████████", ansiCyan, "", "")
+colorRow("    ████████████████████", ansiCyan, "", "")
+colorRow("    ████████████████████", ansiCyan, "", "")
+colorRow("   ██████          ██████", ansiCyan, "", "")
+colorRow("     ████          ████", ansiCyan, "", "")
+colorRow("     ████          ████", ansiCyan, "", "")
+colorRow("      ██            ██", ansiCyan, "", "")
+
+	row("", "")
+	colorRow("", "", strings.Repeat(boxHorizontal, rightWidth), ansiDim)
+	colorRow("", "", " Recent activity", ansiOrange+ansiBold)
+	colorRow(" AWS FinOps & Remediation · v1.0.0", ansiDim, " No recent activity", ansiDim)
+	row("", "")
+
+	// ── 6. Bottom border ──────────────────────────────────────────────────────
+	bottom := boxBottomLeft + strings.Repeat(boxHorizontal, width-2) + boxBottomRight
+	fmt.Printf("%s%s%s\n", ansiAmber, bottom, ansiReset)
 	fmt.Println()
 }
 
