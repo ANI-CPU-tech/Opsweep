@@ -199,15 +199,26 @@ func scanResources(ctx context.Context, cfg aws.Config) []discovery.Resource {
 	return resources
 }
 
-// runScan executes a full discovery scan, prints the waste table, and
-// optionally runs live deletion when --teardown is present.
+// runScan executes a full discovery scan, prints the waste table (filtered
+// by the confidence threshold in the user's config), and optionally runs live
+// deletion when --teardown is present.
+//
+// The config is loaded fresh on each invocation so changes the user makes to
+// ~/.opssweep.yaml take effect on the next /scan without restarting the shell.
 func runScan(ctx context.Context, cfg aws.Config, flags []string) {
+	// Load user config; fall back to safe defaults if the file does not exist.
+	appConfig, err := config.LoadDefault()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, ansiRed+"[ERROR]"+ansiReset+" Failed to load config: %v\n", err)
+		return
+	}
+
 	resources := scanResources(ctx, cfg)
 	if resources == nil {
 		return
 	}
 
-	if err := ui.PrintWasteReport(os.Stdout, resources); err != nil {
+	if err := ui.PrintWasteReport(os.Stdout, resources, appConfig); err != nil {
 		fmt.Fprintf(os.Stderr, ansiRed+"[ERROR]"+ansiReset+" Failed to render report: %v\n", err)
 		return
 	}
@@ -217,11 +228,13 @@ func runScan(ctx context.Context, cfg aws.Config, flags []string) {
 	}
 
 	fmt.Println()
-	fmt.Println(ansiRed + "[WARNING] Executing live teardown. Resources will be permanently deleted." + ansiReset)
+	fmt.Printf("%s[WARNING] Executing live teardown (confidence threshold: %.0f%%). Resources will be permanently deleted.%s\n",
+		ansiRed, appConfig.Rules.ConfidenceThreshold, ansiReset)
 	fmt.Println()
 
-	// Process takes the full slice and applies the 0.90 confidence threshold
-	// internally. isDryRun=false means real AWS deletion API calls are made.
+	// Process takes the full slice and applies its own internal 0.90 threshold
+	// for actual deletion (a safety floor that cannot be lowered via config).
+	// isDryRun=false means real AWS deletion API calls are made.
 	remediator := remediation.NewRemediator(cfg)
 	if err := remediator.Process(ctx, resources, false); err != nil {
 		fmt.Fprintf(os.Stderr, ansiRed+"[ERROR]"+ansiReset+" Teardown failed: %v\n", err)
@@ -230,7 +243,17 @@ func runScan(ctx context.Context, cfg aws.Config, flags []string) {
 
 // runReport executes a full discovery scan and writes an HTML audit report.
 // The output path defaults to "audit.html"; pass --output=<path> to override.
+//
+// The config is loaded fresh on each invocation so changes to ~/.opssweep.yaml
+// take effect immediately without restarting the shell.
 func runReport(ctx context.Context, cfg aws.Config, flags []string) {
+	// Load user config; fall back to safe defaults if the file does not exist.
+	appConfig, err := config.LoadDefault()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, ansiRed+"[ERROR]"+ansiReset+" Failed to load config: %v\n", err)
+		return
+	}
+
 	resources := scanResources(ctx, cfg)
 	if resources == nil {
 		return
@@ -248,7 +271,9 @@ func runReport(ctx context.Context, cfg aws.Config, flags []string) {
 		return
 	}
 
-	fmt.Println(ansiGreen + "[REPORT] Successfully generated FinOps audit at " + outputPath + ansiReset)
+	// Print the active threshold so the user knows what filter was applied.
+	fmt.Printf("%s[REPORT]%s Successfully generated FinOps audit at %s (threshold: %.0f%%)\n",
+		ansiGreen, ansiReset, outputPath, appConfig.Rules.ConfidenceThreshold)
 }
 
 // runInit generates the default ~/.opssweep.yaml configuration file on disk.

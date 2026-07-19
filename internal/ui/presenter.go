@@ -16,6 +16,7 @@ import (
 
 	"golang.org/x/term"
 
+	"github.com/anirudh/opssweep/internal/config"
 	"github.com/anirudh/opssweep/internal/discovery"
 	"github.com/anirudh/opssweep/internal/heuristics"
 	"github.com/anirudh/opssweep/internal/pricing"
@@ -191,17 +192,19 @@ colorRow("      ██            ██", ansiCyan, "", "")
 }
 
 const (
-	// idleConfidenceThreshold is the minimum heuristics confidence score for a
-	// resource to appear in the waste report.
-	idleConfidenceThreshold = 0.5
-
 	// separatorWidth is the character width of the dashed separator line.
 	separatorWidth = 72
 )
 
 // PrintWasteReport writes a tab-aligned terminal table of idle resources and
 // their estimated monthly cost to out.
-func PrintWasteReport(out io.Writer, resources []discovery.Resource) error {
+//
+// The confidence threshold applied to filter resources is taken from
+// appConfig.Rules.ConfidenceThreshold (0.0–100.0 scale). Only resources whose
+// heuristics score × 100 meets or exceeds that threshold are included in the
+// report. This replaces the previous hardcoded 0.5 constant so operators can
+// tune reporting sensitivity via ~/.opssweep.yaml without recompiling.
+func PrintWasteReport(out io.Writer, resources []discovery.Resource, appConfig *config.Config) error {
 	cfg := heuristics.DefaultConfig()
 
 	type row struct {
@@ -220,7 +223,11 @@ func PrintWasteReport(out io.Writer, resources []discovery.Resource) error {
 		if score.ShouldSkip {
 			continue
 		}
-		if score.Confidence < idleConfidenceThreshold {
+		// score.Confidence is in the 0.0–1.0 range; ConfidenceThreshold is
+		// stored as 0.0–100.0 in the config. Multiply before comparing so
+		// the units match. Both sides of the comparison are now config-driven
+		// rather than hardcoded.
+		if (score.Confidence * 100) < appConfig.Rules.ConfidenceThreshold {
 			continue
 		}
 		cost := pricing.CalculateMonthlyWaste(res, true)
