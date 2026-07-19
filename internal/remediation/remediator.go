@@ -16,11 +16,14 @@ package remediation
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 
+	"github.com/anirudh/opssweep/internal/audit"
 	"github.com/anirudh/opssweep/internal/discovery"
 	"github.com/anirudh/opssweep/internal/heuristics"
 	"github.com/anirudh/opssweep/internal/pricing"
@@ -65,19 +68,22 @@ func NewRemediator(cfg aws.Config) *Remediator {
 //
 // # Dry-run mode (isDryRun == true)
 //
-// Prints a yellow warning line for each qualifying resource:
-//
-//	[DRY RUN] Would delete ec2:elastic-ip: eipalloc-0abc123 (Waste: $3.60/mo)
-//
-// No AWS API calls are made. This is the safe default — the caller must
-// explicitly pass isDryRun=false to trigger live deletions.
+// Prints a yellow warning line for each qualifying resource. No AWS API calls
+// are made and db is not written to — pass nil for db in dry-run mode.
 //
 // # Live mode (isDryRun == false)
 //
-// Live deletion calls will be added per resource type in subsequent commits.
-// Until a resource type has a concrete deletion implementation, Process falls
-// back to the dry-run output with a "[NOT YET IMPLEMENTED]" suffix so the
-// operator always knows what would happen.
+// Calls the appropriate AWS deletion API for each qualifying resource.
+// On success, writes an immutable audit record to db via [audit.LogDeletion].
+// A db write failure emits a yellow warning but does NOT abort the deletion
+// loop — the resource has already been deleted from AWS at that point, and
+// stopping mid-queue would leave remaining resources unprocessed.
+//
+// # Nil db safety
+//
+// db may be nil only when isDryRun is true. Passing nil for a live run will
+// cause a panic when LogDeletion is called; the caller is responsible for
+// initialising the database before calling Process with isDryRun=false.
 //
 // # Filtering
 //
@@ -88,6 +94,7 @@ func (r *Remediator) Process(
 	ctx context.Context,
 	resources []discovery.Resource,
 	isDryRun bool,
+	db *sql.DB,
 ) error {
 	cfg := heuristics.DefaultConfig()
 
@@ -119,13 +126,37 @@ func (r *Remediator) Process(
 			printDryRun(res, waste)
 		} else {
 			if err := r.deleteResource(ctx, res, waste); err != nil {
-				// Log the error and continue rather than aborting the entire
-				// run. A single failed deletion (e.g. a race condition where
-				// the resource was already deleted) should not block the
-				// remaining queue.
+				// Log the deletion error and continue — a single failed
+				// deletion (e.g. a race condition where the resource was
+				// already deleted) should not block the remaining queue.
 				fmt.Fprintf(os.Stderr,
 					"%sERROR%s: failed to delete %s %s: %v\n",
 					ansiRed, ansiReset, res.Type, res.ID, err,
+				)
+				// Do not audit failed deletions — only confirmed successes
+				// belong in the immutable audit trail.
+				continue
+			}
+
+			// ── Audit the successful deletion ─────────────────────────────
+			// Build a record with the resource details and the exact UTC time
+			// the deletion was confirmed by the AWS API.
+			rec := audit.Record{
+				ResourceID:     res.ID,
+				ResourceType:   string(res.Type),
+				Region:         res.Region,
+				MonthlySavings: waste,
+				DeletedAt:      time.Now().UTC(),
+			}
+
+			if err := audit.LogDeletion(db, rec); err != nil {
+				// A failed audit write is a warning, not a fatal error.
+				// The resource has already been deleted from AWS — halting
+				// the loop here would leave other resources unprocessed.
+				// The operator is warned so they can investigate manually.
+				fmt.Fprintf(os.Stderr,
+					"%s[WARNING]%s Failed to audit deletion of %s %s: %v\n",
+					ansiYellow, ansiReset, res.Type, res.ID, err,
 				)
 			}
 		}

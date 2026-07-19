@@ -25,6 +25,7 @@ import (
 	goprompt "github.com/c-bata/go-prompt"
 	"gopkg.in/yaml.v3"
 
+	"github.com/anirudh/opssweep/internal/audit"
 	"github.com/anirudh/opssweep/internal/config"
 	"github.com/anirudh/opssweep/internal/discovery"
 	"github.com/anirudh/opssweep/internal/remediation"
@@ -237,11 +238,37 @@ func runScan(ctx context.Context, cfg aws.Config, flags []string) {
 		ansiRed, appConfig.Rules.ConfidenceThreshold, ansiReset)
 	fmt.Println()
 
-	// Process takes the full slice and applies its own internal 0.90 threshold
-	// for actual deletion (a safety floor that cannot be lowered via config).
-	// isDryRun=false means real AWS deletion API calls are made.
+	// ── Open the audit database ───────────────────────────────────────────────
+	// The database MUST be ready before any deletion starts. If we cannot
+	// write to the audit trail we abort the teardown entirely — deleting
+	// infrastructure without a record of what was deleted is unacceptable.
+	dbPath, err := audit.GetDefaultDBPath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			ansiRed+"[ERROR]"+ansiReset+" Cannot determine audit DB path: %v\n", err,
+		)
+		return
+	}
+
+	db, err := audit.InitDB(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			ansiRed+"[ERROR]"+ansiReset+" Cannot open audit database: %v\n"+
+				"         Teardown aborted — no infrastructure will be deleted.\n", err,
+		)
+		return
+	}
+	// Always close the connection, even if Process returns an error.
+	defer db.Close()
+
+	fmt.Printf("%s[AUDIT]%s Deletion records will be written to %s\n\n",
+		ansiCyan, ansiReset, dbPath)
+
+	// Process applies its own internal 0.90 confidence threshold as a safety
+	// floor. isDryRun=false means real AWS deletion API calls are made and
+	// every successful deletion is written to the audit DB.
 	remediator := remediation.NewRemediator(cfg)
-	if err := remediator.Process(ctx, resources, false); err != nil {
+	if err := remediator.Process(ctx, resources, false, db); err != nil {
 		fmt.Fprintf(os.Stderr, ansiRed+"[ERROR]"+ansiReset+" Teardown failed: %v\n", err)
 	}
 }
