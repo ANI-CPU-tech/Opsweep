@@ -23,6 +23,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	goprompt "github.com/c-bata/go-prompt"
+	"gopkg.in/yaml.v3"
 
 	"github.com/anirudh/opssweep/internal/config"
 	"github.com/anirudh/opssweep/internal/discovery"
@@ -50,6 +51,7 @@ const (
 var suggestions = []goprompt.Suggest{
 	{Text: "/scan", Description: "Find idle resources. Pass --teardown to delete."},
 	{Text: "/report", Description: "Generate an HTML cost report."},
+	{Text: "/config", Description: "View the currently active configuration."},
 	{Text: "/init", Description: "Generate a default ~/.opssweep.yaml configuration file."},
 	{Text: "/clear", Description: "Clear the terminal screen."},
 	{Text: "/help", Description: "List all commands."},
@@ -112,6 +114,9 @@ func Start(ctx context.Context, cfg aws.Config) {
 
 		case "/report":
 			runReport(ctx, cfg, flags)
+
+		case "/config":
+			runConfig()
 
 		case "/init":
 			runInit()
@@ -303,6 +308,36 @@ func runInit() {
 	fmt.Println(ansiGreen + "[SYSTEM] Successfully generated default configuration at ~/.opssweep.yaml" + ansiReset)
 }
 
+// runConfig loads the active configuration and prints it as a formatted YAML
+// block so the user can verify exactly which settings OpsSweep is using.
+//
+// If no config file exists at ~/.opssweep.yaml, LoadDefault returns the
+// built-in defaults — the output will show those defaults clearly so the user
+// understands what they'd be customising if they ran /init.
+func runConfig() {
+	cfg, err := config.LoadDefault()
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			ansiRed+"[ERROR]"+ansiReset+" Failed to load config: %v\n", err,
+		)
+		return
+	}
+
+	// Marshal back to YAML so the output exactly matches the file format the
+	// user edits. This prevents any confusion between internal field names and
+	// the yaml:"..." tag names that appear in ~/.opssweep.yaml.
+	out, err := yaml.Marshal(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			ansiRed+"[ERROR]"+ansiReset+" Failed to format config: %v\n", err,
+		)
+		return
+	}
+
+	fmt.Println(ansiCyan + "[SYSTEM] Active Configuration:" + ansiReset)
+	fmt.Print(string(out))
+}
+
 // printHelp writes a formatted two-column command reference to stdout.
 func printHelp() {
 	fmt.Println(ansiBold + "Available Commands:" + ansiReset)
@@ -316,6 +351,7 @@ func printHelp() {
 		{"/scan --teardown", "Scan and live-delete high-confidence waste"},
 		{"/report", "Scan and write HTML audit to audit.html"},
 		{"/report --output=<path>", "Write HTML audit to a custom path"},
+		{"/config", "View the currently active configuration"},
 		{"/init", "Generate a default ~/.opssweep.yaml config file"},
 		{"/clear", "Clear the terminal screen"},
 		{"/help", "Show this help message"},
