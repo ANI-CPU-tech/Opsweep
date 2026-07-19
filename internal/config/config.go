@@ -252,3 +252,83 @@ func WriteDefaultConfig(path string) error {
 
 	return nil
 }
+
+// ─── Loading ─────────────────────────────────────────────────────────────────
+
+// LoadConfig reads and parses the YAML config file at path, returning a fully
+// populated *Config on success.
+//
+// # Graceful fallback on missing file
+//
+// If the file does not exist, LoadConfig returns DefaultConfig() and a nil
+// error. This is a deliberate design decision: OpsSweep should work out of the
+// box without requiring the user to run /init first. The missing-file case is
+// not an error — it is the expected state on a first run or a clean install.
+//
+// # Errors that are propagated
+//
+// Any error other than "file not found" is returned to the caller unchanged.
+// The most common real-world cases are:
+//   - Permission denied (0600 file owned by another user)
+//   - Malformed YAML (invalid indentation, unquoted special characters)
+//   - Disk I/O errors
+//
+// In these cases the caller should surface the error to the user rather than
+// silently falling back to defaults, because silent fallback would mask a
+// configuration mistake that the user needs to fix.
+//
+// # Partial config files
+//
+// yaml.Unmarshal only populates fields that are present in the YAML document.
+// Fields absent from the file remain at their zero values (empty string, 0,
+// nil slice). If you want absent fields to inherit their defaults, initialise
+// cfg with DefaultConfig() before unmarshalling — LoadConfig does NOT do this
+// automatically, keeping the function's behaviour transparent and predictable.
+func LoadConfig(path string) (*Config, error) {
+	// ── 1. Read the file ──────────────────────────────────────────────────────
+	data, err := os.ReadFile(path)
+	if err != nil {
+		// Distinguish "file does not exist" from every other I/O error.
+		// os.IsNotExist handles both *os.PathError and *fs.PathError wrapping,
+		// so it works correctly even when the error is wrapped by os.ReadFile.
+		if os.IsNotExist(err) {
+			// Not an error — first run or deliberate config-free usage.
+			// Return defaults so the caller always gets a usable *Config.
+			return DefaultConfig(), nil
+		}
+		// Any other error (permission denied, I/O failure, etc.) is a real
+		// problem that the user needs to know about.
+		return nil, fmt.Errorf("config: failed to read config file %q: %w", path, err)
+	}
+
+	// ── 2. Parse the YAML ─────────────────────────────────────────────────────
+	// Allocate a fresh Config. We do NOT pre-populate it with DefaultConfig()
+	// here — doing so would make it impossible for callers to distinguish
+	// "user explicitly set this value" from "this fell back to a default",
+	// which matters for future merge/override logic.
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("config: failed to parse config file %q: %w", path, err)
+	}
+
+	return &cfg, nil
+}
+
+// LoadDefault is a convenience wrapper around LoadConfig that automatically
+// resolves the canonical config file location: ~/.opssweep.yaml.
+//
+// It is the function most callers should use. LoadConfig is provided for
+// callers that need to load a config from a non-standard path (e.g. a path
+// supplied via a CLI flag or an environment variable).
+//
+// Returns DefaultConfig() with a nil error when the file does not exist,
+// matching the behaviour of LoadConfig for the missing-file case.
+func LoadDefault() (*Config, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("config: could not determine home directory: %w", err)
+	}
+
+	path := filepath.Join(home, ".opssweep.yaml")
+	return LoadConfig(path)
+}
