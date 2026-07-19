@@ -121,23 +121,42 @@ func Start(ctx context.Context, cfg aws.Config) {
 	// Build and run the prompt engine.
 	// OptionPrefix sets the prompt string shown to the left of the cursor.
 	// OptionTitle sets the terminal window/tab title (visible in most terminals).
-	// The color options style the dropdown to match the amber/dark theme.
+	//
+	// Color mapping note: go-prompt's Color constants map to real ANSI codes.
+	// "DarkGray" = \e[100m (high-intensity black BG) which most terminals
+	// render as LIGHT GRAY — that is what caused the washed-out dropdown.
+	// "Black" = \e[40m which is true black and renders dark on all terminals.
 	p := goprompt.New(
 		executor,
 		completer,
 		goprompt.OptionPrefix("> "),
 		goprompt.OptionTitle("OpsSweep"),
-		// Dropdown background — dark so it contrasts with the terminal.
-		goprompt.OptionSuggestionBGColor(goprompt.DarkGray),
+
+		// ── Unselected suggestion rows ────────────────────────────────────────
+		// Black (\e[40m) = true dark background. White (\e[97m) = bright white
+		// text. Together they give maximum contrast on any terminal theme.
+		goprompt.OptionSuggestionBGColor(goprompt.Black),
 		goprompt.OptionSuggestionTextColor(goprompt.White),
-		// Highlighted (selected) row in the dropdown.
-		goprompt.OptionSelectedSuggestionBGColor(goprompt.Brown),
-		goprompt.OptionSelectedSuggestionTextColor(goprompt.White),
-		// Description column (right side of each suggestion row).
-		goprompt.OptionDescriptionBGColor(goprompt.DarkGray),
+
+		// ── Description column (unselected) ──────────────────────────────────
+		// Same black background; LightGray (\e[37m) is slightly dimmer than
+		// White, creating a visual hierarchy between command name and description.
+		goprompt.OptionDescriptionBGColor(goprompt.Black),
 		goprompt.OptionDescriptionTextColor(goprompt.LightGray),
-		goprompt.OptionSelectedDescriptionBGColor(goprompt.Brown),
-		goprompt.OptionSelectedDescriptionTextColor(goprompt.White),
+
+		// ── Selected / highlighted row ────────────────────────────────────────
+		// Cyan (\e[46m) bg gives a vivid teal highlight that matches the tool's
+		// cyan accent. Black (\e[30m) fg on Cyan has the highest contrast ratio.
+		goprompt.OptionSelectedSuggestionBGColor(goprompt.Cyan),
+		goprompt.OptionSelectedSuggestionTextColor(goprompt.Black),
+		goprompt.OptionSelectedDescriptionBGColor(goprompt.Cyan),
+		goprompt.OptionSelectedDescriptionTextColor(goprompt.Black),
+
+		// ── Scrollbar ─────────────────────────────────────────────────────────
+		// Black track blends into the dropdown; LightGray thumb is visible
+		// without distracting from the suggestion content.
+		goprompt.OptionScrollbarBGColor(goprompt.Black),
+		goprompt.OptionScrollbarThumbColor(goprompt.LightGray),
 	)
 	p.Run()
 }
