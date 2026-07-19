@@ -18,11 +18,13 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	goprompt "github.com/c-bata/go-prompt"
 
+	"github.com/anirudh/opssweep/internal/config"
 	"github.com/anirudh/opssweep/internal/discovery"
 	"github.com/anirudh/opssweep/internal/remediation"
 	"github.com/anirudh/opssweep/internal/report"
@@ -48,6 +50,7 @@ const (
 var suggestions = []goprompt.Suggest{
 	{Text: "/scan", Description: "Find idle resources. Pass --teardown to delete."},
 	{Text: "/report", Description: "Generate an HTML cost report."},
+	{Text: "/init", Description: "Generate a default ~/.opssweep.yaml configuration file."},
 	{Text: "/clear", Description: "Clear the terminal screen."},
 	{Text: "/help", Description: "List all commands."},
 	{Text: "/exit", Description: "Exit the application."},
@@ -109,6 +112,9 @@ func Start(ctx context.Context, cfg aws.Config) {
 
 		case "/report":
 			runReport(ctx, cfg, flags)
+
+		case "/init":
+			runInit()
 
 		default:
 			fmt.Println(ansiDim + "Unknown command. Type /help" + ansiReset)
@@ -245,6 +251,33 @@ func runReport(ctx context.Context, cfg aws.Config, flags []string) {
 	fmt.Println(ansiGreen + "[REPORT] Successfully generated FinOps audit at " + outputPath + ansiReset)
 }
 
+// runInit generates the default ~/.opssweep.yaml configuration file on disk.
+//
+// If the file already exists it is overwritten with fresh defaults so the user
+// always gets a clean, fully-commented starting point. A green success message
+// is printed on completion; a red error message is printed if the write fails
+// (e.g. permission denied on the home directory).
+func runInit() {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			ansiRed+"[ERROR]"+ansiReset+" Could not determine home directory: %v\n", err,
+		)
+		return
+	}
+
+	path := filepath.Join(home, ".opssweep.yaml")
+
+	if err := config.WriteDefaultConfig(path); err != nil {
+		fmt.Fprintf(os.Stderr,
+			ansiRed+"[ERROR]"+ansiReset+" Failed to write config: %v\n", err,
+		)
+		return
+	}
+
+	fmt.Println(ansiGreen + "[SYSTEM] Successfully generated default configuration at ~/.opssweep.yaml" + ansiReset)
+}
+
 // printHelp writes a formatted two-column command reference to stdout.
 func printHelp() {
 	fmt.Println(ansiBold + "Available Commands:" + ansiReset)
@@ -258,6 +291,7 @@ func printHelp() {
 		{"/scan --teardown", "Scan and live-delete high-confidence waste"},
 		{"/report", "Scan and write HTML audit to audit.html"},
 		{"/report --output=<path>", "Write HTML audit to a custom path"},
+		{"/init", "Generate a default ~/.opssweep.yaml config file"},
 		{"/clear", "Clear the terminal screen"},
 		{"/help", "Show this help message"},
 		{"/exit", "Exit the interactive shell"},
