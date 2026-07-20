@@ -156,8 +156,17 @@ func scanRegion(
 		return nil
 	})
 
-	// TODO: add goroutines for GetEBSSnapshots and GetLoadBalancers as those
-	// methods are implemented.
+	// ── Load Balancers (ALB/NLB) ──────────────────────────────────────────────
+	innerGroup.Go(func() error {
+		lbs, err := api.GetLoadBalancers(innerCtx, region)
+		if err != nil {
+			return fmt.Errorf("region %s: %w", region, err)
+		}
+		appendSafe(lbs)
+		return nil
+	})
+
+	// TODO: add goroutine for GetEBSSnapshots once that method is implemented.
 
 	return innerGroup.Wait()
 }

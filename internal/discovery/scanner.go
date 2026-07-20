@@ -8,6 +8,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
+	elbv2types "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 )
 
 // Compile-time assertion: AWSScanner must fully satisfy AWSScannerAPI.
@@ -226,10 +228,96 @@ func (s *AWSScanner) GetEBSSnapshots(ctx context.Context, region string) ([]Reso
 }
 
 // GetLoadBalancers returns all ALB, NLB, and CLB load balancers in the given region.
-// TODO: implement using elasticloadbalancingv2.NewDescribeLoadBalancersPaginator
-// (ALB/NLB) and elasticloadbalancing.DescribeLoadBalancers (CLB).
+//
+// Currently only ALB/NLB are supported via the elasticloadbalancingv2 API.
+// Classic Load Balancers (CLB) will be added once the elasticloadbalancing
+// (v1) API integration is implemented.
+//
+// The method paginates automatically — AWS returns at most 400 load balancers
+// per DescribeLoadBalancers page.
+//
+// Load balancers with zero healthy targets are prime candidates for teardown:
+// they consume hourly compute costs and LCU charges without serving any
+// traffic. The heuristics engine flags these by checking target group health
+// (implemented separately via DescribeTargetHealth).
 func (s *AWSScanner) GetLoadBalancers(ctx context.Context, region string) ([]Resource, error) {
-	return nil, nil
+	regionalCfg := s.cfg.Copy()
+	regionalCfg.Region = region
+	client := elasticloadbalancingv2.NewFromConfig(regionalCfg)
+
+	var resources []Resource
+
+	// DescribeLoadBalancersPaginator handles the Marker token loop for us.
+	paginator := elasticloadbalancingv2.NewDescribeLoadBalancersPaginator(client,
+		&elasticloadbalancingv2.DescribeLoadBalancersInput{
+			// No filters: return all load balancers so the heuristics engine
+			// has the complete picture. Filtering here would silently hide
+			// resources from the report.
+		})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("discovery: DescribeLoadBalancers in %s: %w", region, err)
+		}
+
+		for _, lb := range page.LoadBalancers {
+			resources = append(resources, mapLoadBalancer(lb, region))
+		}
+	}
+
+	return resources, nil
+}
+
+// mapLoadBalancer converts an AWS SDK elbv2types.LoadBalancer into our
+// normalised [Resource] struct.
+//
+// ID: LoadBalancerArn is the stable AWS identifier. It is globally unique and
+// survives renames (unlike LoadBalancerName).
+//
+// Type: Discriminates between ALB ("application") and NLB ("network") using
+// the SDK's Type field. This allows the pricing engine to apply the correct
+// hourly base rate ($0.0225/hr for ALB, $0.0225/hr for NLB in us-east-1).
+//
+// State: Maps directly from lb.State.Code (e.g. "active", "provisioning",
+// "failed"). "active" is the only state that incurs LCU charges; others are
+// typically transient setup or teardown phases.
+//
+// Name: Extracted from the LoadBalancerName field. Unlike EC2/EBS resources,
+// ALBs don't use a "Name" tag — the name is a first-class API field.
+//
+// CreationTime: DescribeLoadBalancers returns CreatedTime directly, so this is
+// always populated (never zero).
+func mapLoadBalancer(lb elbv2types.LoadBalancer, region string) Resource {
+	// Determine the correct ResourceType constant based on the load balancer type.
+	var resourceType ResourceType
+	switch lb.Type {
+	case elbv2types.LoadBalancerTypeEnumApplication:
+		resourceType = ResourceTypeALB
+	case elbv2types.LoadBalancerTypeEnumNetwork:
+		resourceType = ResourceTypeNLB
+	default:
+		// Gateway Load Balancers (GWLB) exist but are rare. Map them to ALB
+		// for now so they don't silently disappear from the report. A dedicated
+		// ResourceTypeGWLB can be added later if GWLB-specific heuristics are
+		// needed.
+		resourceType = ResourceTypeALB
+	}
+
+	state := "unknown"
+	if lb.State != nil {
+		state = string(lb.State.Code)
+	}
+
+	return Resource{
+		ID:           aws.ToString(lb.LoadBalancerArn),
+		Type:         resourceType,
+		Region:       region,
+		Name:         aws.ToString(lb.LoadBalancerName),
+		State:        state,
+		Tags:         nil, // TODO: fetch tags via DescribeTags if needed for reporting
+		CreationTime: aws.ToTime(lb.CreatedTime),
+	}
 }
 
 // GetRDSInstances is implemented in rds.go.
