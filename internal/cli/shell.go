@@ -20,6 +20,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"text/tabwriter"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	goprompt "github.com/c-bata/go-prompt"
@@ -52,6 +54,7 @@ const (
 var suggestions = []goprompt.Suggest{
 	{Text: "/scan", Description: "Find idle resources. Pass --teardown to delete."},
 	{Text: "/report", Description: "Generate an HTML cost report."},
+	{Text: "/history", Description: "View the most recently deleted infrastructure."},
 	{Text: "/config", Description: "View the currently active configuration."},
 	{Text: "/init", Description: "Generate a default ~/.opssweep.yaml configuration file."},
 	{Text: "/clear", Description: "Clear the terminal screen."},
@@ -118,6 +121,9 @@ func Start(ctx context.Context, cfg aws.Config) {
 
 		case "/config":
 			runConfig()
+
+		case "/history":
+			runHistory()
 
 		case "/init":
 			runInit()
@@ -365,6 +371,89 @@ func runConfig() {
 	fmt.Print(string(out))
 }
 
+// runHistory opens the audit database, fetches the 15 most recent deletion
+// records, and renders them in a tab-aligned table.
+//
+// # Empty database
+//
+// If no teardowns have ever been run, the audit_logs table will be empty.
+// runHistory prints a friendly message rather than an empty table so the user
+// isn't left wondering whether something went wrong.
+//
+// # First run
+//
+// InitDB creates the database file if it does not exist yet, so runHistory is
+// safe to call even before the first /scan --teardown. The empty-slice branch
+// handles that case gracefully.
+func runHistory() {
+	// ── 1. Open the audit database ────────────────────────────────────────────
+	dbPath, err := audit.GetDefaultDBPath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			ansiRed+"[ERROR]"+ansiReset+" Cannot determine audit DB path: %v\n", err,
+		)
+		return
+	}
+
+	db, err := audit.InitDB(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			ansiRed+"[ERROR]"+ansiReset+" Cannot open audit database: %v\n", err,
+		)
+		return
+	}
+	defer db.Close()
+
+	// ── 2. Fetch recent records ───────────────────────────────────────────────
+	records, err := audit.GetRecentDeletions(db, 15)
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			ansiRed+"[ERROR]"+ansiReset+" Failed to read deletion history: %v\n", err,
+		)
+		return
+	}
+
+	// ── 3. Render the table ───────────────────────────────────────────────────
+	if len(records) == 0 {
+		fmt.Println(ansiDim + "No deletion history found." + ansiReset)
+		return
+	}
+
+	fmt.Println(ansiCyan + "[HISTORY] Recent deletions (newest first):" + ansiReset)
+	fmt.Println()
+
+	// tabwriter aligns columns by padding each cell with spaces until all
+	// cells in a column share the same visible width. The arguments are:
+	//   output   — writer to flush into
+	//   minwidth — minimum column width in chars (0 = content-driven)
+	//   tabwidth — width of tab characters (unused; we use '\t' as delimiter)
+	//   padding  — spaces added between columns (2 = breathing room)
+	//   padchar  — padding character (' ' = space)
+	//   flags    — 0 = default (left-align all columns)
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+
+	// Header row — column names match the struct fields users care about.
+	fmt.Fprintln(tw, "TIME\tRESOURCE ID\tTYPE\tREGION\tSAVED")
+
+	for _, rec := range records {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t$%.2f\n",
+			// "Mon Jan 2 15:04:05" is Go's reference time in a human-readable
+			// format. It's compact enough to fit in the column without wrapping
+			// on an 80-char terminal while still giving full date and time.
+			rec.DeletedAt.Local().Format(time.Stamp),
+			rec.ResourceID,
+			rec.ResourceType,
+			rec.Region,
+			rec.MonthlySavings,
+		)
+	}
+
+	// Flush must be called explicitly — tabwriter buffers all output until
+	// it has seen enough rows to compute column widths. Without Flush, nothing
+	// is written to os.Stdout.
+	tw.Flush()
+}
+
 // printHelp writes a formatted two-column command reference to stdout.
 func printHelp() {
 	fmt.Println(ansiBold + "Available Commands:" + ansiReset)
@@ -378,6 +467,7 @@ func printHelp() {
 		{"/scan --teardown", "Scan and live-delete high-confidence waste"},
 		{"/report", "Scan and write HTML audit to audit.html"},
 		{"/report --output=<path>", "Write HTML audit to a custom path"},
+		{"/history", "View the 15 most recently deleted resources"},
 		{"/config", "View the currently active configuration"},
 		{"/init", "Generate a default ~/.opssweep.yaml config file"},
 		{"/clear", "Clear the terminal screen"},

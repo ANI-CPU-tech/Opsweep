@@ -251,3 +251,85 @@ func LogDeletion(db *sql.DB, rec Record) error {
 
 	return nil
 }
+
+// ─── Read operations ──────────────────────────────────────────────────────────
+
+// GetRecentDeletions returns the most recent audit records from the database,
+// ordered newest-first, up to the specified limit.
+//
+// # Parameterized query
+//
+// The LIMIT clause uses a "?" placeholder for the same reason INSERT does —
+// even though limit is an internal integer, using parameterization is a
+// non-negotiable habit that eliminates an entire class of bugs.
+//
+// # Row lifecycle
+//
+// The caller must not use the returned slice after the function returns an
+// error. On success, the slice owns copies of all column values — there is
+// no reference back to the underlying sql.Rows cursor, which is fully
+// consumed and closed before this function returns.
+//
+// # Empty result
+//
+// When the audit_logs table exists but contains no rows (e.g. no teardowns
+// have been run yet), GetRecentDeletions returns an empty slice and a nil
+// error. The caller should check len(records) == 0 to show a friendly
+// "no history yet" message rather than treating it as an error condition.
+func GetRecentDeletions(db *sql.DB, limit int) ([]Record, error) {
+	// SELECT the five payload columns in the same order that rows.Scan reads
+	// them below. id is excluded because callers display human-readable fields,
+	// not internal row identifiers.
+	const query = `
+		SELECT resource_id, resource_type, region, monthly_savings, deleted_at
+		FROM   audit_logs
+		ORDER  BY deleted_at DESC
+		LIMIT  ?`
+
+	// db.Query returns a *sql.Rows cursor. It does NOT read all data into
+	// memory up-front — rows are fetched one at a time in the loop below.
+	rows, err := db.Query(query, limit)
+	if err != nil {
+		return nil, fmt.Errorf("audit: failed to query recent deletions: %w", err)
+	}
+	// defer rows.Close() is essential: it releases the database connection
+	// back to the pool and frees any server-side cursor resources. Without
+	// this, repeated calls to GetRecentDeletions would exhaust the connection
+	// pool. It is safe to call Close on already-closed rows.
+	defer rows.Close()
+
+	var records []Record
+
+	for rows.Next() {
+		var rec Record
+
+		// rows.Scan reads the current row's columns into the provided pointers
+		// in the exact order they appear in the SELECT list above.
+		// The go-sqlite3 driver automatically converts:
+		//   TEXT    → string
+		//   REAL    → float64
+		//   DATETIME (ISO 8601 TEXT) → time.Time
+		if err := rows.Scan(
+			&rec.ResourceID,
+			&rec.ResourceType,
+			&rec.Region,
+			&rec.MonthlySavings,
+			&rec.DeletedAt,
+		); err != nil {
+			return nil, fmt.Errorf("audit: failed to scan deletion record: %w", err)
+		}
+
+		records = append(records, rec)
+	}
+
+	// rows.Err() returns any error that interrupted the iteration loop above
+	// (e.g. a network error mid-result-set). It must be checked separately
+	// from the loop because rows.Next() silently swallows iteration errors —
+	// it just returns false when the error occurs, same as when the result
+	// set is genuinely exhausted.
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("audit: error iterating deletion records: %w", err)
+	}
+
+	return records, nil
+}
